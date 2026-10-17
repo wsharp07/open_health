@@ -576,6 +576,23 @@ impl RingSession {
             result = self.factory_reset_inner(key_hex, confirm_serial) => result,
         }
     }
+
+    /// Turn on the ring's automatic daytime-HR and SpO2 measurement if they are off.
+    /// A factory reset (or a desktop `oura pair`) leaves them off, and then the ring
+    /// records no HR, HRV or SpO2. Returns the labels of the features it switched on
+    /// (empty when both were already on). Authenticates on the current link.
+    pub async fn ensure_measurements(&self, key_hex: String) -> Result<Vec<String>, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.ensure_measurements_inner(key_hex) => result,
+        }
+    }
 }
 
 impl RingSession {
@@ -622,6 +639,36 @@ impl RingSession {
         )
         .await;
         Ok(serial)
+    }
+
+    async fn ensure_measurements_inner(&self, key_hex: String) -> Result<Vec<String>, SyncError> {
+        use oura_protocol::protocol::{feature, feature_mode};
+        let fail = SyncError::Failed;
+        let key = parse_key(&key_hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let client = OuraClient::new(FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        });
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        let mut enabled = Vec::new();
+        for (label, id) in [("daytime HR", feature::DAYTIME_HR), ("SpO2", feature::SPO2)] {
+            let on = client
+                .feature_status(id)
+                .await
+                .map(|s| s.mode == feature_mode::AUTOMATIC)
+                .unwrap_or(false);
+            if !on {
+                client
+                    .set_feature_mode(id, feature_mode::AUTOMATIC)
+                    .await
+                    .map_err(|e| fail(format!("enabling {label}: {e}")))?;
+                enabled.push(label.to_string());
+            }
+        }
+        Ok(enabled)
     }
 
     async fn pair_inner(
