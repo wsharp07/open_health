@@ -294,6 +294,12 @@ pub trait SyncProgressListener: Send + Sync {
     fn on_progress(&self, stage: String, bytes_left: u64, events_synced: u32);
 }
 
+/// Swift implements this to receive each live heart-rate beat.
+#[uniffi::export(callback_interface)]
+pub trait LiveHeartRateListener: Send + Sync {
+    fn on_beat(&self, bpm: u16, ibi_ms: u16);
+}
+
 #[derive(uniffi::Record)]
 pub struct SyncReport {
     pub serial: String,
@@ -593,6 +599,27 @@ impl RingSession {
             result = self.ensure_measurements_inner(key_hex) => result,
         }
     }
+
+    /// Stream live heart-rate beats to `listener` for up to `seconds`; returns the
+    /// beat count. The ring must be worn. If cancelled mid-stream the ring leaves
+    /// live mode by itself in ~20 s. Authenticates on the current link.
+    pub async fn live_heart_rate(
+        &self,
+        key_hex: String,
+        seconds: u32,
+        listener: Box<dyn LiveHeartRateListener>,
+    ) -> Result<u32, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.live_heart_rate_inner(key_hex, seconds, listener) => result,
+        }
+    }
 }
 
 impl RingSession {
@@ -639,6 +666,33 @@ impl RingSession {
         )
         .await;
         Ok(serial)
+    }
+
+    async fn live_heart_rate_inner(
+        &self,
+        key_hex: String,
+        seconds: u32,
+        listener: Box<dyn LiveHeartRateListener>,
+    ) -> Result<u32, SyncError> {
+        let fail = SyncError::Failed;
+        let key = parse_key(&key_hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let client = OuraClient::new(FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        });
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        let mut count = 0u32;
+        client
+            .live_heart_rate(std::time::Duration::from_secs(seconds as u64), false, |s| {
+                count += 1;
+                listener.on_beat(s.bpm, s.ibi_ms)
+            })
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        Ok(count)
     }
 
     async fn ensure_measurements_inner(&self, key_hex: String) -> Result<Vec<String>, SyncError> {
