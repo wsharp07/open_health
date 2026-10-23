@@ -600,6 +600,22 @@ impl RingSession {
         }
     }
 
+    /// Diagnostics: authenticate, then send each hex-encoded request and collect every
+    /// frame that arrives within the quiet window. Returns one line per request,
+    /// `"<request> -> <frame> <frame>…"`. No validation of what is sent: callers own it.
+    pub async fn send_raw(&self, key_hex: String, requests_hex: Vec<String>) -> Result<Vec<String>, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.send_raw_inner(key_hex, requests_hex) => result,
+        }
+    }
+
     /// Stream live heart-rate beats to `listener` for up to `seconds`; returns the
     /// beat count. The ring must be worn. If cancelled mid-stream the ring leaves
     /// live mode by itself in ~20 s. Authenticates on the current link.
@@ -693,6 +709,29 @@ impl RingSession {
             .await
             .map_err(|e| fail(e.to_string()))?;
         Ok(count)
+    }
+
+    async fn send_raw_inner(&self, key_hex: String, requests_hex: Vec<String>) -> Result<Vec<String>, SyncError> {
+        let fail = SyncError::Failed;
+        let key = parse_key(&key_hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let requests = requests_hex
+            .iter()
+            .map(|r| parse_hex(r).ok_or_else(|| fail(format!("not hex: {r}"))))
+            .collect::<Result<Vec<_>, _>>()?;
+        let transport = FfiTransport { tx: self.tx.clone(), writer: self.writer.clone() };
+        OuraClient::new(FfiTransport { tx: self.tx.clone(), writer: self.writer.clone() })
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        let mut lines = Vec::new();
+        for req in requests {
+            let frames = oura_link::transport::transact(&transport, &req, std::time::Duration::from_millis(1500))
+                .await
+                .map_err(|e| fail(e.to_string()))?;
+            let reply: Vec<String> = frames.iter().map(|f| bytes_hex(f)).collect();
+            lines.push(format!("{} -> {}", bytes_hex(&req), if reply.is_empty() { "(no reply)".into() } else { reply.join(" ") }));
+        }
+        Ok(lines)
     }
 
     async fn ensure_measurements_inner(&self, key_hex: String) -> Result<Vec<String>, SyncError> {
@@ -949,6 +988,19 @@ fn to_hex(key: &[u8; 16]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn bytes_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Hex with any whitespace; None unless it is a non-empty, even run of hex digits.
+fn parse_hex(input: &str) -> Option<Vec<u8>> {
+    let hex: String = input.split_whitespace().collect();
+    if hex.is_empty() || hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect()
+}
+
 fn parse_key(hex: &str) -> Option<[u8; 16]> {
     let hex = hex.trim();
     if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -964,6 +1016,16 @@ fn parse_key(hex: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_spaced_hex_and_rejects_junk() {
+        assert_eq!(parse_hex("31 04 00 00 00 00"), Some(vec![0x31, 4, 0, 0, 0, 0]));
+        assert_eq!(parse_hex("2f0220"), Some(vec![0x2f, 2, 0x20]));
+        assert_eq!(parse_hex("abc"), None);
+        assert_eq!(parse_hex("zz"), None);
+        assert_eq!(parse_hex(""), None);
+        assert_eq!(bytes_hex(&[0x0a, 0xff]), "0aff");
+    }
 
     #[test]
     fn minted_keys_round_trip_through_hex() {
