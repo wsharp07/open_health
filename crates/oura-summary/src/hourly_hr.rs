@@ -25,7 +25,8 @@
 //! highest beat actually measured, and the mean of every beat in between. There is no
 //! open/close — a heart rate is not a share price, and "the first beat of the hour"
 //! carries no information the range and the mean do not. Only `hrv_event` carries
-//! per-sample spacing (`interval_min`), so its samples are placed at `ds + i·interval`;
+//! per-sample spacing (`interval_min`), so its samples are placed by `hrv_samples`
+//! (the event's timestamp ends the block, element i starts `(n − i)·interval` before);
 //! the beat streams have no per-sample timestamps and sit at their event's time, which
 //! is honest — an event covers seconds, not hours.
 //!
@@ -161,21 +162,27 @@ pub fn hr_bins(
         let Ok(v) = serde_json::from_str::<Value>(jstr) else {
             continue;
         };
-        let Some(bpms) = v["hr_bpm"].as_array() else {
-            continue;
-        };
-        // hrv_event packs `interval_min`-minute averages; element i is that much later.
-        let step_ds = if name == "hrv_event" {
-            v["interval_min"].as_i64().unwrap_or(5).max(1) * 600
+        // hrv_event packs `interval_min`-minute averages that END at its timestamp;
+        // beats sit at their event's time.
+        let samples: Vec<(i64, f64)> = if name == "hrv_event" {
+            crate::hrv_samples(*ds, &v)
+                .into_iter()
+                .filter_map(|(at, hr, _)| hr.map(|bpm| (at, bpm)))
+                .collect()
         } else {
-            0
+            let Some(bpms) = v["hr_bpm"].as_array() else {
+                continue;
+            };
+            bpms.iter()
+                .filter_map(Value::as_f64)
+                .map(|bpm| (*ds, bpm))
+                .collect()
         };
-        for (i, x) in bpms.iter().enumerate() {
-            let Some(bpm) = x.as_f64() else { continue };
+        for (sample_ds, bpm) in samples {
             if !(MIN_BPM..=MAX_BPM).contains(&bpm) {
                 continue;
             }
-            let at = clock.unix_s(*ds + i as i64 * step_ds, *cu);
+            let at = clock.unix_s(sample_ds, *cu);
             let bar = bins.entry(bucket_start(at, tz, span)).or_default();
             bar.add(bpm);
             if name == "hrv_event" {
@@ -370,11 +377,12 @@ mod tests {
                 72_000,
                 json!({ "hr_bpm": [50, 500] }),
             );
-            // +3 h: firmware 5-minute averages — both land in the same hour
+            // +3 h: firmware 5-minute averages for 3:00–3:10, written as the block
+            // closes at 3:10 — both land in the same hour
             push(
                 0x5d,
                 "hrv_event",
-                108_000,
+                114_000,
                 json!({ "interval_min": 5, "hr_bpm": [40, 45] }),
             );
             // +3 h: raw beat-to-beat, deliberately ignored — a 170 bpm "beat" during
@@ -476,11 +484,12 @@ mod tests {
                 45_000,
                 json!({ "hr_bpm": [80] }),
             );
-            // +3:00, +3:05, +3:10: three 5-minute averages, all in the 3:00 slot
+            // +3:00, +3:05, +3:10: three 5-minute averages, all in the 3:00 slot,
+            // written as the block closes at 3:15
             push(
                 0x5d,
                 "hrv_event",
-                108_000,
+                117_000,
                 json!({ "interval_min": 5, "hr_bpm": [40, 45, 50] }),
             );
         }

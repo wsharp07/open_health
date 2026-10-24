@@ -460,6 +460,27 @@ fn median_of(values: &[f64]) -> Option<f64> {
     })
 }
 
+/// The `(window start ds, hr_bpm, rmssd_ms)` samples of one `hrv_event`. The ring
+/// writes the event when a block of `interval_min`-minute averages closes (or early,
+/// part-full, when a sync asks for history), so its timestamp is the END of the last
+/// window: element i of n starts (n − i)·interval before it. Against a Ring 4's
+/// beat-to-beat stream this places HR within 0.5–1 bpm; read as start-of-block it is
+/// 4–7 bpm off and half an hour late. Zero means no reading and comes back as `None`.
+pub(crate) fn hrv_samples(event_ds: i64, v: &Value) -> Vec<(i64, Option<f64>, Option<f64>)> {
+    let step_ds = v["interval_min"].as_i64().unwrap_or(5).max(1) * 600;
+    let empty = Vec::new();
+    let hr = v["hr_bpm"].as_array().unwrap_or(&empty);
+    let rmssd = v["rmssd_ms"].as_array().unwrap_or(&empty);
+    let n = hr.len().max(rmssd.len());
+    let reading = |a: &Vec<Value>, i: usize| a.get(i).and_then(Value::as_f64).filter(|&x| x > 0.0);
+    (0..n)
+        .map(|i| {
+            let start_ds = event_ds - (n - i) as i64 * step_ds;
+            (start_ds, reading(hr, i), reading(rmssd, i))
+        })
+        .collect()
+}
+
 fn nightly_skin_temp(temps_c: &[f64]) -> Option<f64> {
     let centi: Vec<u16> = temps_c
         .iter()
@@ -1237,29 +1258,30 @@ pub fn stage_nights_from_signals(db: &Path, sleep_ranges: &[[i64; 3]]) -> Option
         let mut hr_t = Vec::new();
         let mut hrv_t = Vec::new();
         let mut motion_t = Vec::new();
+        let in_range = |ds: i64| start_ds - 600 <= ds && ds <= end_ds + 600;
         for (ds, tag, jstr, _cu) in &events {
-            if *ds < start_ds - 600 || *ds > end_ds + 600 {
-                continue;
-            }
             if *tag == 0x5d {
+                // Judge each sample by its own window: the event's timestamp is the end
+                // of a block that can reach half an hour back (see `hrv_samples`).
                 if let Ok(v) = serde_json::from_str::<Value>(jstr) {
-                    let step_ds = v["interval_min"].as_i64().unwrap_or(5).max(1) * 600;
-                    if let Some(a) = v["hr_bpm"].as_array() {
-                        for (i, x) in a.iter().enumerate() {
-                            if let Some(val) = x.as_f64().filter(|&v| v > 0.0) {
-                                hr_t.push((*ds + i as i64 * step_ds, val));
-                            }
+                    for (sample_ds, hr, rmssd) in hrv_samples(*ds, &v) {
+                        if !in_range(sample_ds) {
+                            continue;
                         }
-                    }
-                    if let Some(a) = v["rmssd_ms"].as_array() {
-                        for (i, x) in a.iter().enumerate() {
-                            if let Some(val) = x.as_f64().filter(|&v| v > 0.0) {
-                                hrv_t.push((*ds + i as i64 * step_ds, val));
-                            }
+                        if let Some(val) = hr {
+                            hr_t.push((sample_ds, val));
+                        }
+                        if let Some(val) = rmssd {
+                            hrv_t.push((sample_ds, val));
                         }
                     }
                 }
-            } else if *tag == 0x47 {
+                continue;
+            }
+            if !in_range(*ds) {
+                continue;
+            }
+            if *tag == 0x47 {
                 if let Ok(v) = serde_json::from_str::<Value>(jstr) {
                     if let Some(s) = v["motion_seconds"].as_f64() {
                         motion_t.push((*ds, s));
@@ -2227,42 +2249,39 @@ pub fn build_summary(
         if !is_dated(*ds, *cu) {
             continue;
         }
+        let n = name_of(*tag);
+        if n == "hrv_event" {
+            // One event spans up to half an hour of 5-minute averages, so each sample
+            // finds its own night: the block written just after waking still holds the
+            // last minutes of sleep, and the first one after bedtime holds minutes
+            // before it. Keep both the flat vecs (mean/min) and the timestamped samples
+            // (stage-resolved autonomics).
+            let Ok(v) = serde_json::from_str::<Value>(jstr) else {
+                continue;
+            };
+            for (sample_ds, hr, rmssd) in hrv_samples(*ds, &v) {
+                let Some(idx) = find_night(sample_ds, *cu, &nights) else {
+                    continue;
+                };
+                if let Some(val) = rmssd {
+                    nights[idx].rmssd.push(val);
+                    nights[idx].hrv_t.push((sample_ds, val));
+                }
+                if let Some(val) = hr {
+                    nights[idx].hr.push(val);
+                    nights[idx].hr_t.push((sample_ds, val));
+                }
+            }
+            continue;
+        }
         let Some(idx) = find_night(*ds, *cu, &nights) else {
             continue;
         };
-        let n = name_of(*tag);
         let v: Value = match serde_json::from_str(jstr) {
             Ok(v) => v,
             Err(_) => continue,
         };
         match n {
-            "hrv_event" => {
-                // Each array element is an `interval_min`-minute average starting at the
-                // event's ring timestamp, so element i sits at ds + i·interval (in
-                // deciseconds: minutes × 600). Keep both the flat vecs (mean/min) and the
-                // timestamped samples (stage-resolved autonomics).
-                let step_ds = v["interval_min"].as_i64().unwrap_or(5).max(1) * 600;
-                if let Some(a) = v["rmssd_ms"].as_array() {
-                    for (i, x) in a.iter().enumerate() {
-                        if let Some(val) = x.as_f64() {
-                            if val > 0.0 {
-                                nights[idx].rmssd.push(val);
-                                nights[idx].hrv_t.push((*ds + i as i64 * step_ds, val));
-                            }
-                        }
-                    }
-                }
-                if let Some(a) = v["hr_bpm"].as_array() {
-                    for (i, x) in a.iter().enumerate() {
-                        if let Some(val) = x.as_f64() {
-                            if val > 0.0 {
-                                nights[idx].hr.push(val);
-                                nights[idx].hr_t.push((*ds + i as i64 * step_ds, val));
-                            }
-                        }
-                    }
-                }
-            }
             "sleep_period_information_2" => {
                 // The ring's own per-window sleep sample. Breathing while awake is
                 // faster and more variable, so only sleep windows count.
@@ -3879,6 +3898,101 @@ mod tests {
         assert_eq!(night_reset["start_ds"], 10_000);
         assert_eq!(night_reset["end_ds"], 298_000);
         assert_eq!(night_reset["bedtime_manual"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hrv_samples_end_at_the_event_timestamp() {
+        let v = json!({ "interval_min": 5, "hr_bpm": [70, 0, 72], "rmssd_ms": [20, 21, 0] });
+        assert_eq!(
+            hrv_samples(30_000, &v),
+            vec![
+                (21_000, Some(70.0), Some(20.0)),
+                (24_000, None, Some(21.0)),
+                (27_000, Some(72.0), None),
+            ]
+        );
+        // a part-full block flushed by a sync still ends at its own timestamp
+        let partial = json!({ "hr_bpm": [68], "rmssd_ms": [27] });
+        assert_eq!(
+            hrv_samples(30_000, &partial),
+            vec![(27_000, Some(68.0), Some(27.0))]
+        );
+    }
+
+    #[test]
+    fn hrv_blocks_split_across_bedtime_edges_by_sample() {
+        // Ring 4: each hrv_event closes a half-hour block of 5-minute averages. The block
+        // written just after bedtime is mostly from before it; the one written after
+        // waking is mostly from the night and must not be dropped with its timestamp.
+        let dir = std::env::temp_dir().join(format!(
+            "oura-hrv-block-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("oura.db");
+        drop(Store::open(&db).unwrap());
+
+        let base_unix = 1_780_000_000i64;
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let insert = |ds: i64, tag: i64, name: &str, json: String| {
+            conn.execute(
+                "INSERT INTO events (serial, tag, name, ring_timestamp, body, decoded_json, captured_unix)
+                 VALUES ('S1', ?1, ?2, ?3, X'00', ?4, ?5)",
+                rusqlite::params![tag, name, ds, json, base_unix + 31_000],
+            )
+            .unwrap();
+        };
+        insert(
+            1_000,
+            66,
+            "time_sync",
+            format!("{{\"unix_time\":{base_unix}}}"),
+        );
+        insert(
+            298_000,
+            118,
+            "bedtime_period",
+            "{\"bedtime_start_ds\":10000,\"bedtime_end_ds\":298000}".into(),
+        );
+        // windows start at -5 000 … 10 000: only the last (10 000–13 000) is in bed
+        insert(
+            13_000,
+            93,
+            "hrv_event",
+            "{\"hr_bpm\":[90,90,90,90,90,60],\"rmssd_ms\":[9,9,9,9,9,30]}".into(),
+        );
+        // windows start at 286 000 … 301 000: all but the last are in bed
+        insert(
+            304_000,
+            93,
+            "hrv_event",
+            "{\"hr_bpm\":[55,50,55,55,55,40],\"rmssd_ms\":[30,30,30,30,30,9]}".into(),
+        );
+        drop(conn);
+
+        let sum = build_summary(&db, 0.0, &NoModelRunner).unwrap();
+        let night = &sum["nights"].as_array().unwrap()[0];
+        assert_eq!(
+            night["rhr"], 50.0,
+            "the block written after waking counts: {night}"
+        );
+        assert_eq!(
+            night["hrv_ms"], 30.0,
+            "pre-bed and post-wake windows stay out"
+        );
+        let hr = night["series_t"]["hr"].as_array().unwrap();
+        assert_eq!(hr.len(), 6);
+        assert_eq!(
+            hr[0],
+            json!([(base_unix + 900) as f64, 60.0]),
+            "first sample at bedtime"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
