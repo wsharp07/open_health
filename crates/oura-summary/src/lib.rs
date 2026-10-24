@@ -13,6 +13,7 @@
 //! `docs/clients-web-and-ios.md`.
 
 pub mod hourly_hr;
+pub mod readiness;
 pub mod ring_time;
 pub mod sleep_score;
 pub mod symptoms;
@@ -2023,6 +2024,12 @@ pub fn build_summary(
     let _ = Store::migrate_if_writable(db);
     let store = Store::open_read_only(db).context("opening DB")?;
     let events = store.decoded_events().context("reading events")?;
+    // Which ring sent what: one sync talks to one ring, so the capture second says.
+    let serial_at: std::collections::HashMap<i64, String> = store
+        .serials_by_capture()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     if events.is_empty() {
         return Err(anyhow!(
             "no decoded events in {} — run `oura sync` first",
@@ -2417,6 +2424,8 @@ pub fn build_summary(
     // self-inclusion or future-data leakage.
     let mut prior_main_rhr: Vec<(f64, f64)> = Vec::new();
     let mut prior_main_hrv: Vec<(f64, f64)> = Vec::new();
+    // Readiness inputs, oldest first, aligned with `nights_json`.
+    let mut readiness_nights: Vec<readiness::NightIn> = Vec::new();
     for nt in &nights {
         let hyp = hyps.get(&(nt.start_ds, nt.captured_unix));
         let raw_stages: Vec<i64> = hyp
@@ -2604,7 +2613,27 @@ pub fn build_summary(
                 age: demo.age,
             }) } else { Value::Null },
             "breath_rate": night_breath.map(|b| (b * 10.0).round() / 10.0),
+            // the ring that measured this night, so baselines can stay on one ring
+            "serial": serial_at.get(&nt.captured_unix),
         }));
+        let lowest_hr_unix = nt
+            .hr_t
+            .iter()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|&(ds, _)| unix_s_at(ds, nt.captured_unix));
+        readiness_nights.push(readiness::NightIn {
+            serial: serial_at.get(&nt.captured_unix).cloned(),
+            wake_day: (end_unix as i64 + offset_seconds(tz)).div_euclid(86_400),
+            start_unix,
+            end_unix,
+            rhr: night_rhr,
+            lowest_hr_unix,
+            hrv_ms: night_hrv,
+            skin_temp: nightly_skin_temp(&nt.temp).map(|x| (x * 10.0).round() / 10.0),
+            sleep_score: nights_json
+                .last()
+                .and_then(|n| n["sleep_score"]["score"].as_f64()),
+        });
         if is_main_sleep {
             if let Some(lowest) = raw_lowest_hr {
                 prior_main_rhr.push((end_unix, lowest));
@@ -2651,6 +2680,8 @@ pub fn build_summary(
     let mut prof_cnt: std::collections::BTreeMap<String, [u32; 96]> = Default::default();
     let mut daily: std::collections::BTreeMap<String, (f64, f64)> = Default::default();
     let mut met_min: std::collections::BTreeMap<i64, f64> = Default::default();
+    // (ring, local day) → (active MET-minutes, minutes with a reading), for readiness.
+    let mut ring_days: std::collections::BTreeMap<(String, i64), (f64, u32)> = Default::default();
     let weight = demo.weight_kg;
     // Resting daily expenditure via ecore's Schofield BMR (by age band + sex), instead
     // of the old flat `weight × 24` approximation. Added to active kcal for total kcal.
@@ -2696,6 +2727,11 @@ pub fn build_summary(
                     e.1 += step_rate;
                     *met_min.entry((local / 60.0).floor() as i64).or_insert(0.0) +=
                         (mv - 1.0).max(0.0);
+                    if let Some(serial) = serial_at.get(cu) {
+                        let d = ring_days.entry((serial.clone(), day_idx)).or_default();
+                        d.0 += (mv - 1.0).max(0.0);
+                        d.1 += 1;
+                    }
                 }
             }
         }
@@ -2723,6 +2759,22 @@ pub fn build_summary(
                 .sum();
             sess["active_kcal"] = json!(kcal.round());
         }
+    }
+
+    // Readiness per main sleep, from that ring's own earlier nights and days only.
+    let readiness_days: Vec<readiness::DayIn> = ring_days
+        .iter()
+        .map(|((serial, day), &(met, minutes))| readiness::DayIn {
+            serial: serial.clone(),
+            day: *day,
+            active_met_min: met,
+            minutes,
+        })
+        .collect();
+    let newest_first = nights_json.len();
+    for i in 0..readiness_nights.len() {
+        nights_json[newest_first - 1 - i]["readiness"] =
+            readiness::readiness_for(&readiness_nights, i, &readiness_days).unwrap_or(Value::Null);
     }
 
     let activity_daily: Value = daily
@@ -3985,6 +4037,10 @@ mod tests {
         assert_eq!(
             night["hrv_ms"], 30.0,
             "pre-bed and post-wake windows stay out"
+        );
+        assert_eq!(
+            night["serial"], "S1",
+            "each night names the ring that measured it"
         );
         let hr = night["series_t"]["hr"].as_array().unwrap();
         assert_eq!(hr.len(), 6);

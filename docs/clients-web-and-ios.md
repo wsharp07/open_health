@@ -164,6 +164,12 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
 - **Symptom Radar details**: all four biomarkers with their personal band
   (`lower`/`upper`); the web lists only the flagged ones.
 
+## Known gaps (in the summary, rendered by neither client yet)
+
+- **Readiness** (`nights[].readiness`): an Oura-like score per main sleep with its
+  contributors (`readiness.rs`); the Noura app renders it, the web and `OuraApp` don't.
+- **Ring serial per night** (`nights[].serial`): which ring measured the night.
+
 ## Known gaps (web-only, not yet on iOS)
 
 - **One-page day view**: web shows Sleep, Activity and Heart rate on one scrolling page, every
