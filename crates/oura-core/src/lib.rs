@@ -294,10 +294,12 @@ pub trait SyncProgressListener: Send + Sync {
     fn on_progress(&self, stage: String, bytes_left: u64, events_synced: u32);
 }
 
-/// Swift implements this to receive each live heart-rate beat.
+/// Swift implements this to receive each live heart-rate beat and SpO2 reading.
 #[uniffi::export(callback_interface)]
 pub trait LiveHeartRateListener: Send + Sync {
     fn on_beat(&self, bpm: u16, ibi_ms: u16);
+    /// A fresh SpO2 measurement (percent); much sparser than beats.
+    fn on_spo2(&self, percent: u8);
 }
 
 #[derive(uniffi::Record)]
@@ -402,34 +404,73 @@ impl Transport for FfiTransport {
     }
 }
 
-/// Read live heart-rate frames until `duration` ends. Every packet in a notification
-/// counts (the ring packs several into one), each valid beat goes to `on_beat`, and a
-/// ring that refuses live mode ends the stream with an error. Returns the beats seen.
-async fn stream_live_beats(
+/// One reading from a live stream.
+#[derive(Debug, PartialEq)]
+enum LiveReading {
+    Beat { bpm: u16, ibi_ms: u16 },
+    Spo2(u8),
+}
+
+/// How often a live stream asks for SpO2's latest values, in case the ring measures
+/// without pushing them.
+const SPO2_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Read live frames until `duration` ends. Every packet in a notification counts (the
+/// ring packs several into one), each valid beat and fresh SpO2 reading goes to
+/// `on_reading`, and a ring that refuses live heart rate ends the stream with an error.
+/// Asks for SpO2's latest values every `spo2_poll`. Returns the beats seen.
+async fn stream_live(
+    transport: &impl Transport,
     rx: &mut broadcast::Receiver<Vec<u8>>,
     duration: std::time::Duration,
-    mut on_beat: impl FnMut(u16, u16),
+    spo2_poll: std::time::Duration,
+    mut on_reading: impl FnMut(LiveReading),
 ) -> Result<u32, SyncError> {
-    use oura_protocol::protocol::{feature, Packet};
+    use oura_protocol::protocol::{self as proto, feature, Packet};
     let deadline = tokio::time::Instant::now() + duration;
+    let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + spo2_poll, spo2_poll);
+    let mut spo2 = Spo2Freshness::default();
     let mut count = 0u32;
     loop {
-        match tokio::time::timeout_at(deadline, rx.recv()).await {
+        let frame = tokio::select! {
+            _ = poll.tick() => {
+                transport
+                    .write(&proto::req_feature_latest(feature::SPO2))
+                    .await
+                    .map_err(|e| SyncError::Failed(e.to_string()))?;
+                continue;
+            }
+            frame = tokio::time::timeout_at(deadline, rx.recv()) => frame,
+        };
+        match frame {
             Ok(Ok(frame)) => {
                 for p in Packet::parse_many(&frame) {
-                    match p.ext_tag() {
-                        // SetFeatureMode answer: [0x23, feature, result].
-                        Some(0x23) if p.payload.get(1) == Some(&feature::DAYTIME_HR) => {
-                            if let Some(&result) = p.payload.get(2).filter(|&&r| r != 0) {
+                    let payload = &p.payload;
+                    match (p.ext_tag(), payload.get(1).copied()) {
+                        // SetFeatureMode answer: [0x23, feature, result]. SpO2 refusing
+                        // live mode still leaves heart rate (and the polled values).
+                        (Some(0x23), Some(feature::DAYTIME_HR)) => {
+                            if let Some(&result) = payload.get(2).filter(|&&r| r != 0) {
                                 return Err(SyncError::Failed(format!(
                                     "live heart rate refused: set_feature_mode result {result:#04x}"
                                 )));
                             }
                         }
-                        Some(0x28) => {
+                        (Some(0x28), Some(feature::DAYTIME_HR)) => {
                             if let Some((bpm, ibi_ms)) = live_beat(&p) {
                                 count += 1;
-                                on_beat(bpm, ibi_ms);
+                                on_reading(LiveReading::Beat { bpm, ibi_ms });
+                            }
+                        }
+                        (Some(0x28), Some(feature::SPO2)) => {
+                            if let Some(pct) = payload.get(6..).and_then(|d| spo2.pushed(d)) {
+                                on_reading(LiveReading::Spo2(pct));
+                            }
+                        }
+                        // GetFeatureLatestValues answer; only a successful one carries data.
+                        (Some(0x25), Some(feature::SPO2)) if payload.get(2) == Some(&0) => {
+                            if let Some(pct) = payload.get(7..).and_then(|d| spo2.polled(d)) {
+                                on_reading(LiveReading::Spo2(pct));
                             }
                         }
                         _ => {}
@@ -441,6 +482,36 @@ async fn stream_live_beats(
         }
     }
     Ok(count)
+}
+
+/// Keeps a live stream from showing SpO2 the ring measured before it started. The
+/// ring's SpO2 values (data `[3]`=SpO2 %, `[4]`=bpm, as oura-link reads the latest
+/// values; a live indication carries the same record without the result byte) stay
+/// cached between measurements, so the first polled record is the old one, and an
+/// unchanged record is no new measurement.
+#[derive(Default)]
+struct Spo2Freshness {
+    polled_once: bool,
+    last: Option<Vec<u8>>,
+}
+
+impl Spo2Freshness {
+    fn polled(&mut self, data: &[u8]) -> Option<u8> {
+        if !self.polled_once {
+            self.polled_once = true;
+            self.last = Some(data.to_vec());
+            return None;
+        }
+        self.pushed(data)
+    }
+
+    fn pushed(&mut self, data: &[u8]) -> Option<u8> {
+        if self.last.as_deref() == Some(data) {
+            return None;
+        }
+        self.last = Some(data.to_vec());
+        data.get(3).copied().filter(|pct| (70..=100).contains(pct))
+    }
 }
 
 /// A daytime-HR live indication (`2f <len> 28`), as oura-link decodes it: payload
@@ -673,8 +744,8 @@ impl RingSession {
         }
     }
 
-    /// Stream live heart-rate beats to `listener` for up to `seconds`; returns the
-    /// beat count. The ring must be worn. If cancelled mid-stream the ring leaves
+    /// Stream live heart-rate beats and SpO2 readings to `listener` for up to
+    /// `seconds`; returns the beat count. The ring must be worn. If cancelled mid-stream the ring leaves
     /// live mode by itself in ~20 s. Authenticates on the current link; fails if the
     /// ring refuses live mode.
     pub async fn live_heart_rate(
@@ -762,29 +833,42 @@ impl RingSession {
         .authenticate(&key)
         .await
         .map_err(|e| fail(e.to_string()))?;
-        // Subscribed before the writes, so neither the ring's answer nor the first beats
-        // are missed.
+        // Subscribed before the writes, so neither the ring's answers nor the first
+        // readings are missed.
         let mut rx = transport.subscribe();
         while rx.try_recv().is_ok() {}
-        // The Oura app's live readout writes both (open_oura's "DHR burst" probe:
-        // `2f03220203` + `2f03260202`). Live mode alone ACKs, but the ring pushes no
-        // beats until daytime HR is also subscribed, which is all oura-link's
-        // `live_heart_rate` sends.
         let write = |req: Vec<u8>| {
             let transport = &transport;
             async move { transport.write(&req).await.map_err(|e| fail(e.to_string())) }
         };
-        write(proto::req_set_feature_mode(feature::DAYTIME_HR, feature_mode::CONNECTED_LIVE)).await?;
-        write(proto::req_set_feature_subscription(feature::DAYTIME_HR, subscription_mode::LATEST)).await?;
-        let result = stream_live_beats(
+        // SpO2's cached values before anything changes, so the stream can tell the
+        // last measurement from a new one.
+        write(proto::req_feature_latest(feature::SPO2)).await?;
+        // The Oura app's live readout writes both (open_oura's "DHR burst" probe:
+        // `2f03220203` + `2f03260202`). Live mode alone ACKs, but the ring pushes no
+        // beats until daytime HR is also subscribed, which is all oura-link's
+        // `live_heart_rate` sends. SpO2 gets the same pair.
+        const LIVE: [u8; 2] = [feature::DAYTIME_HR, feature::SPO2];
+        for id in LIVE {
+            write(proto::req_set_feature_mode(id, feature_mode::CONNECTED_LIVE)).await?;
+            write(proto::req_set_feature_subscription(id, subscription_mode::LATEST)).await?;
+        }
+        let result = stream_live(
+            &transport,
             &mut rx,
             std::time::Duration::from_secs(seconds as u64),
-            |bpm, ibi_ms| listener.on_beat(bpm, ibi_ms),
+            SPO2_POLL,
+            |reading| match reading {
+                LiveReading::Beat { bpm, ibi_ms } => listener.on_beat(bpm, ibi_ms),
+                LiveReading::Spo2(pct) => listener.on_spo2(pct),
+            },
         )
         .await;
         // Best-effort restore, after a refusal too.
-        let _ = write(proto::req_set_feature_subscription(feature::DAYTIME_HR, subscription_mode::OFF)).await;
-        let _ = write(proto::req_set_feature_mode(feature::DAYTIME_HR, feature_mode::AUTOMATIC)).await;
+        for id in LIVE {
+            let _ = write(proto::req_set_feature_subscription(id, subscription_mode::OFF)).await;
+            let _ = write(proto::req_set_feature_mode(id, feature_mode::AUTOMATIC)).await;
+        }
         result
     }
 
@@ -1226,40 +1310,113 @@ mod tests {
         vec![0x2f, 0x08, 0x28, 0x02, 0x00, 0x00, 0x00, 0x00, lo, hi]
     }
 
+    /// SpO2 values `[0, 0, 0, pct, bpm, 0, 0]`: pushed (`28`) or as a latest-values answer (`25`).
+    fn spo2_pushed(pct: u8, bpm: u8) -> Vec<u8> {
+        vec![0x2f, 0x0d, 0x28, 0x04, 0, 0, 0, 0, 0, 0, 0, pct, bpm, 0, 0]
+    }
+    fn spo2_polled(pct: u8, bpm: u8) -> Vec<u8> {
+        vec![0x2f, 0x0e, 0x25, 0x04, 0x00, 0, 0, 0, 0, 0, 0, 0, pct, bpm, 0, 0]
+    }
+
+    struct Recorder(Mutex<Vec<Vec<u8>>>);
+    impl BleWriter for Recorder {
+        fn write(&self, data: Vec<u8>) {
+            self.0.lock().unwrap().push(data);
+        }
+    }
+
+    /// Runs `stream_live` over `frames` (already queued) for `ms`, polling every `poll_ms`.
+    async fn live_readings(
+        frames: Vec<Vec<u8>>,
+        ms: u64,
+        poll_ms: u64,
+    ) -> (Result<u32, SyncError>, Vec<LiveReading>, Vec<Vec<u8>>) {
+        let (tx, mut rx) = broadcast::channel(16);
+        let writer = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let transport = FfiTransport { tx: tx.clone(), writer: writer.clone() };
+        for f in frames {
+            tx.send(f).unwrap();
+        }
+        let mut readings = Vec::new();
+        let result = stream_live(
+            &transport,
+            &mut rx,
+            std::time::Duration::from_millis(ms),
+            std::time::Duration::from_millis(poll_ms),
+            |r| readings.push(r),
+        )
+        .await;
+        let writes = writer.0.lock().unwrap().clone();
+        (result, readings, writes)
+    }
+
     #[tokio::test]
     async fn live_beats_read_every_packet_in_a_notification() {
-        let (tx, mut rx) = broadcast::channel(16);
         // The ring's ACK and two valid beats packed into one notification.
         let mut packed = vec![0x2f, 0x03, 0x23, 0x02, 0x00];
         packed.extend(live_frame(0x1000 | 1000));
         packed.extend(live_frame(0x1000 | 750));
-        tx.send(packed).unwrap();
-        tx.send(live_frame(0x2000 | 800)).unwrap(); // not valid
-        tx.send(live_frame(0x1000 | 100)).unwrap(); // implausible interval
         let mut other = live_frame(0x1000 | 900);
         other[3] = 0x03; // exercise HR, not daytime
-        tx.send(other).unwrap();
-        let mut beats = Vec::new();
-        let count = stream_live_beats(&mut rx, std::time::Duration::from_millis(50), |bpm, ibi| {
-            beats.push((bpm, ibi))
-        })
-        .await
-        .unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(beats, vec![(60, 1000), (80, 750)]);
+        let frames = vec![
+            packed,
+            live_frame(0x2000 | 800), // not valid
+            live_frame(0x1000 | 100), // implausible interval
+            other,
+        ];
+        let (result, readings, _) = live_readings(frames, 50, 10_000).await;
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(
+            readings,
+            vec![
+                LiveReading::Beat { bpm: 60, ibi_ms: 1000 },
+                LiveReading::Beat { bpm: 80, ibi_ms: 750 },
+            ]
+        );
     }
 
     #[tokio::test]
     async fn live_beats_fail_when_the_ring_refuses_live_mode() {
-        let (tx, mut rx) = broadcast::channel(16);
-        tx.send(vec![0x2f, 0x03, 0x23, 0x02, 0x02]).unwrap();
-        let result = stream_live_beats(&mut rx, std::time::Duration::from_secs(5), |_, _| {}).await;
+        let (result, _, _) = live_readings(vec![vec![0x2f, 0x03, 0x23, 0x02, 0x02]], 5_000, 10_000).await;
         assert!(matches!(result, Err(SyncError::Failed(m)) if m.contains("live heart rate refused")));
     }
 
     #[tokio::test]
-    async fn live_heart_rate_subscribes_daytime_hr_and_restores_it() {
-        /// Answers auth with open_oura's known key + nonce vector, then streams a beat.
+    async fn live_spo2_skips_the_cached_measurement_and_repeats() {
+        let frames = vec![
+            spo2_polled(95, 60),             // cached from before the stream: not shown
+            vec![0x2f, 0x03, 0x23, 0x04, 0x02], // SpO2 refusing live mode isn't fatal
+            spo2_pushed(97, 62),
+            spo2_pushed(97, 62),             // same record again: no new measurement
+            spo2_polled(97, 62),
+            spo2_polled(0, 0),               // nothing measured
+            spo2_polled(98, 61),
+            live_frame(0x1000 | 1000),
+        ];
+        let (result, readings, _) = live_readings(frames, 50, 10_000).await;
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(
+            readings,
+            vec![
+                LiveReading::Spo2(97),
+                LiveReading::Spo2(98),
+                LiveReading::Beat { bpm: 60, ibi_ms: 1000 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_stream_polls_spo2() {
+        let (result, _, writes) = live_readings(Vec::new(), 110, 25).await;
+        assert!(result.is_ok());
+        assert!(writes.len() >= 3, "{writes:?}");
+        assert!(writes.iter().all(|w| w == &[0x2f, 0x02, 0x24, 0x04]));
+    }
+
+    #[tokio::test]
+    async fn live_heart_rate_subscribes_daytime_hr_and_spo2_and_restores_them() {
+        /// Answers auth with open_oura's known key + nonce vector, then streams a beat
+        /// and an SpO2 reading.
         struct LiveRing {
             tx: broadcast::Sender<Vec<u8>>,
             writes: Mutex<Vec<String>>,
@@ -1270,8 +1427,11 @@ mod tests {
                 let reply: &[&str] = match hex.as_str() {
                     "2f012b" => &["2f102c0e2d6a0a08c99b4365f458e6e97382"],
                     "2f112da38a8772d3acb6db5c2b516dd56987c8" => &["2f022e00"],
+                    "2f022404" => &["2f0e250400000000000000005f3c0000"],
                     "2f03220203" => &["2f03230200"],
                     "2f03260202" => &["2f03270200", "2f08280200000000e813"],
+                    "2f03220403" => &["2f03230400"],
+                    "2f03260402" => &["2f03270400", "2f0d280400000000000000613e0000"],
                     _ => &[],
                 };
                 for r in reply {
@@ -1280,26 +1440,39 @@ mod tests {
                 self.writes.lock().unwrap().push(hex);
             }
         }
-        struct Beats(Arc<Mutex<Vec<(u16, u16)>>>);
-        impl LiveHeartRateListener for Beats {
+        struct Readings(Arc<Mutex<Vec<String>>>);
+        impl LiveHeartRateListener for Readings {
             fn on_beat(&self, bpm: u16, ibi_ms: u16) {
-                self.0.lock().unwrap().push((bpm, ibi_ms));
+                self.0.lock().unwrap().push(format!("beat {bpm} {ibi_ms}"));
+            }
+            fn on_spo2(&self, percent: u8) {
+                self.0.lock().unwrap().push(format!("spo2 {percent}"));
             }
         }
         let (tx, _) = broadcast::channel(64);
         let ring = Arc::new(LiveRing { tx: tx.clone(), writes: Mutex::new(Vec::new()) });
         let session = RingSession { stop: watch::channel(None).0, tx, writer: ring.clone() };
-        let beats = Arc::new(Mutex::new(Vec::new()));
+        let readings = Arc::new(Mutex::new(Vec::new()));
         let count = session
-            .live_heart_rate("4431967d8bacc2659743142b68391d9a".into(), 1, Box::new(Beats(beats.clone())))
+            .live_heart_rate("4431967d8bacc2659743142b68391d9a".into(), 1, Box::new(Readings(readings.clone())))
             .await
             .unwrap();
         assert_eq!(count, 1);
-        assert_eq!(*beats.lock().unwrap(), vec![(60, 1000)]);
+        assert_eq!(*readings.lock().unwrap(), ["beat 60 1000", "spo2 97"]);
         let writes = ring.writes.lock().unwrap();
         assert_eq!(
-            writes[writes.len() - 4..],
-            ["2f03220203", "2f03260202", "2f03260200", "2f03220201"]
+            writes[writes.len() - 9..],
+            [
+                "2f022404",
+                "2f03220203",
+                "2f03260202",
+                "2f03220403",
+                "2f03260402",
+                "2f03260200",
+                "2f03220201",
+                "2f03260400",
+                "2f03220401",
+            ]
         );
     }
 
