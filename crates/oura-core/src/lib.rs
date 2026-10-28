@@ -402,6 +402,63 @@ impl Transport for FfiTransport {
     }
 }
 
+/// Read live heart-rate frames until `duration` ends. Every packet in a notification
+/// counts (the ring packs several into one), each valid beat goes to `on_beat`, and a
+/// ring that refuses live mode ends the stream with an error. Returns the beats seen.
+async fn stream_live_beats(
+    rx: &mut broadcast::Receiver<Vec<u8>>,
+    duration: std::time::Duration,
+    mut on_beat: impl FnMut(u16, u16),
+) -> Result<u32, SyncError> {
+    use oura_protocol::protocol::{feature, Packet};
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut count = 0u32;
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Ok(frame)) => {
+                for p in Packet::parse_many(&frame) {
+                    match p.ext_tag() {
+                        // SetFeatureMode answer: [0x23, feature, result].
+                        Some(0x23) if p.payload.get(1) == Some(&feature::DAYTIME_HR) => {
+                            if let Some(&result) = p.payload.get(2).filter(|&&r| r != 0) {
+                                return Err(SyncError::Failed(format!(
+                                    "live heart rate refused: set_feature_mode result {result:#04x}"
+                                )));
+                            }
+                        }
+                        Some(0x28) => {
+                            if let Some((bpm, ibi_ms)) = live_beat(&p) {
+                                count += 1;
+                                on_beat(bpm, ibi_ms);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            _ => break,
+        }
+    }
+    Ok(count)
+}
+
+/// A daytime-HR live indication (`2f <len> 28`), as oura-link decodes it: payload
+/// `[0]=0x28 [1]=feature [2]=status [3]=state [4..6]=timeSince [6..8]=IBI`, the IBI word a
+/// 12-bit interval (ms) under a 4-bit validity nibble (1 = valid). `(bpm, ibi_ms)`.
+fn live_beat(p: &oura_protocol::protocol::Packet) -> Option<(u16, u16)> {
+    let payload = &p.payload;
+    if payload.len() < 8 || payload[1] != oura_protocol::protocol::feature::DAYTIME_HR {
+        return None;
+    }
+    let (lo, hi) = (payload[6], payload[7]);
+    let ibi_ms = (((hi & 0x0f) as u16) << 8) | lo as u16;
+    if hi >> 4 != 1 || !(300..=2000).contains(&ibi_ms) {
+        return None;
+    }
+    Some(((60_000 / ibi_ms as u32) as u16, ibi_ms))
+}
+
 /// Drain one incremental range, inserting each event before checkpointing its batch.
 /// Returning `false` from either callback makes oura-link withhold the ring ACK, so a
 /// database failure can never advance the cursor past data that was not persisted.
@@ -618,7 +675,8 @@ impl RingSession {
 
     /// Stream live heart-rate beats to `listener` for up to `seconds`; returns the
     /// beat count. The ring must be worn. If cancelled mid-stream the ring leaves
-    /// live mode by itself in ~20 s. Authenticates on the current link.
+    /// live mode by itself in ~20 s. Authenticates on the current link; fails if the
+    /// ring refuses live mode.
     pub async fn live_heart_rate(
         &self,
         key_hex: String,
@@ -690,25 +748,44 @@ impl RingSession {
         seconds: u32,
         listener: Box<dyn LiveHeartRateListener>,
     ) -> Result<u32, SyncError> {
+        use oura_protocol::protocol::{self as proto, feature, feature_mode, subscription_mode};
         let fail = SyncError::Failed;
         let key = parse_key(&key_hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
-        let client = OuraClient::new(FfiTransport {
+        let transport = FfiTransport {
             tx: self.tx.clone(),
             writer: self.writer.clone(),
-        });
-        client
-            .authenticate(&key)
-            .await
-            .map_err(|e| fail(e.to_string()))?;
-        let mut count = 0u32;
-        client
-            .live_heart_rate(std::time::Duration::from_secs(seconds as u64), false, |s| {
-                count += 1;
-                listener.on_beat(s.bpm, s.ibi_ms)
-            })
-            .await
-            .map_err(|e| fail(e.to_string()))?;
-        Ok(count)
+        };
+        OuraClient::new(FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        })
+        .authenticate(&key)
+        .await
+        .map_err(|e| fail(e.to_string()))?;
+        // Subscribed before the writes, so neither the ring's answer nor the first beats
+        // are missed.
+        let mut rx = transport.subscribe();
+        while rx.try_recv().is_ok() {}
+        // The Oura app's live readout writes both (open_oura's "DHR burst" probe:
+        // `2f03220203` + `2f03260202`). Live mode alone ACKs, but the ring pushes no
+        // beats until daytime HR is also subscribed, which is all oura-link's
+        // `live_heart_rate` sends.
+        let write = |req: Vec<u8>| {
+            let transport = &transport;
+            async move { transport.write(&req).await.map_err(|e| fail(e.to_string())) }
+        };
+        write(proto::req_set_feature_mode(feature::DAYTIME_HR, feature_mode::CONNECTED_LIVE)).await?;
+        write(proto::req_set_feature_subscription(feature::DAYTIME_HR, subscription_mode::LATEST)).await?;
+        let result = stream_live_beats(
+            &mut rx,
+            std::time::Duration::from_secs(seconds as u64),
+            |bpm, ibi_ms| listener.on_beat(bpm, ibi_ms),
+        )
+        .await;
+        // Best-effort restore, after a refusal too.
+        let _ = write(proto::req_set_feature_subscription(feature::DAYTIME_HR, subscription_mode::OFF)).await;
+        let _ = write(proto::req_set_feature_mode(feature::DAYTIME_HR, feature_mode::AUTOMATIC)).await;
+        result
     }
 
     async fn send_raw_inner(&self, key_hex: String, requests_hex: Vec<String>) -> Result<Vec<String>, SyncError> {
@@ -1141,6 +1218,89 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A daytime-HR live indication (`2f 08 28 02 ...`) carrying `ibi_word` (LE).
+    fn live_frame(ibi_word: u16) -> Vec<u8> {
+        let [lo, hi] = ibi_word.to_le_bytes();
+        vec![0x2f, 0x08, 0x28, 0x02, 0x00, 0x00, 0x00, 0x00, lo, hi]
+    }
+
+    #[tokio::test]
+    async fn live_beats_read_every_packet_in_a_notification() {
+        let (tx, mut rx) = broadcast::channel(16);
+        // The ring's ACK and two valid beats packed into one notification.
+        let mut packed = vec![0x2f, 0x03, 0x23, 0x02, 0x00];
+        packed.extend(live_frame(0x1000 | 1000));
+        packed.extend(live_frame(0x1000 | 750));
+        tx.send(packed).unwrap();
+        tx.send(live_frame(0x2000 | 800)).unwrap(); // not valid
+        tx.send(live_frame(0x1000 | 100)).unwrap(); // implausible interval
+        let mut other = live_frame(0x1000 | 900);
+        other[3] = 0x03; // exercise HR, not daytime
+        tx.send(other).unwrap();
+        let mut beats = Vec::new();
+        let count = stream_live_beats(&mut rx, std::time::Duration::from_millis(50), |bpm, ibi| {
+            beats.push((bpm, ibi))
+        })
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(beats, vec![(60, 1000), (80, 750)]);
+    }
+
+    #[tokio::test]
+    async fn live_beats_fail_when_the_ring_refuses_live_mode() {
+        let (tx, mut rx) = broadcast::channel(16);
+        tx.send(vec![0x2f, 0x03, 0x23, 0x02, 0x02]).unwrap();
+        let result = stream_live_beats(&mut rx, std::time::Duration::from_secs(5), |_, _| {}).await;
+        assert!(matches!(result, Err(SyncError::Failed(m)) if m.contains("live heart rate refused")));
+    }
+
+    #[tokio::test]
+    async fn live_heart_rate_subscribes_daytime_hr_and_restores_it() {
+        /// Answers auth with open_oura's known key + nonce vector, then streams a beat.
+        struct LiveRing {
+            tx: broadcast::Sender<Vec<u8>>,
+            writes: Mutex<Vec<String>>,
+        }
+        impl BleWriter for LiveRing {
+            fn write(&self, data: Vec<u8>) {
+                let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+                let reply: &[&str] = match hex.as_str() {
+                    "2f012b" => &["2f102c0e2d6a0a08c99b4365f458e6e97382"],
+                    "2f112da38a8772d3acb6db5c2b516dd56987c8" => &["2f022e00"],
+                    "2f03220203" => &["2f03230200"],
+                    "2f03260202" => &["2f03270200", "2f08280200000000e813"],
+                    _ => &[],
+                };
+                for r in reply {
+                    let _ = self.tx.send(parse_hex(r).unwrap());
+                }
+                self.writes.lock().unwrap().push(hex);
+            }
+        }
+        struct Beats(Arc<Mutex<Vec<(u16, u16)>>>);
+        impl LiveHeartRateListener for Beats {
+            fn on_beat(&self, bpm: u16, ibi_ms: u16) {
+                self.0.lock().unwrap().push((bpm, ibi_ms));
+            }
+        }
+        let (tx, _) = broadcast::channel(64);
+        let ring = Arc::new(LiveRing { tx: tx.clone(), writes: Mutex::new(Vec::new()) });
+        let session = RingSession { stop: watch::channel(None).0, tx, writer: ring.clone() };
+        let beats = Arc::new(Mutex::new(Vec::new()));
+        let count = session
+            .live_heart_rate("4431967d8bacc2659743142b68391d9a".into(), 1, Box::new(Beats(beats.clone())))
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(*beats.lock().unwrap(), vec![(60, 1000)]);
+        let writes = ring.writes.lock().unwrap();
+        assert_eq!(
+            writes[writes.len() - 4..],
+            ["2f03220203", "2f03260202", "2f03260200", "2f03220201"]
+        );
     }
 
     #[test]
