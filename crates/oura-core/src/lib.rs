@@ -294,6 +294,12 @@ pub trait SyncProgressListener: Send + Sync {
     fn on_progress(&self, stage: String, bytes_left: u64, events_synced: u32);
 }
 
+/// Swift implements this to receive each live heart-rate beat.
+#[uniffi::export(callback_interface)]
+pub trait LiveHeartRateListener: Send + Sync {
+    fn on_beat(&self, bpm: u16, ibi_ms: u16);
+}
+
 #[derive(uniffi::Record)]
 pub struct SyncReport {
     pub serial: String,
@@ -615,6 +621,60 @@ impl RingSession {
             result = self.factory_reset_inner(key_hex, confirm_serial) => result,
         }
     }
+
+    /// Turn on the ring's automatic daytime-HR and SpO2 measurement if they are off.
+    /// A factory reset (or a desktop `oura pair`) leaves them off, and then the ring
+    /// records no HR, HRV or SpO2. Returns the labels of the features it switched on
+    /// (empty when both were already on). Authenticates on the current link.
+    pub async fn ensure_measurements(&self, key_hex: String) -> Result<Vec<String>, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.ensure_measurements_inner(key_hex) => result,
+        }
+    }
+
+    /// Diagnostics: authenticate, then send each hex-encoded request and collect every
+    /// frame that arrives within the quiet window. Returns one line per request,
+    /// `"<request> -> <frame> <frame>…"`. No validation of what is sent: callers own it.
+    pub async fn send_raw(&self, key_hex: String, requests_hex: Vec<String>) -> Result<Vec<String>, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.send_raw_inner(key_hex, requests_hex) => result,
+        }
+    }
+
+    /// Stream live heart-rate beats to `listener` for up to `seconds`; returns the
+    /// beat count. The ring must be worn. If cancelled mid-stream the ring leaves
+    /// live mode by itself in ~20 s. Authenticates on the current link.
+    pub async fn live_heart_rate(
+        &self,
+        key_hex: String,
+        seconds: u32,
+        listener: Box<dyn LiveHeartRateListener>,
+    ) -> Result<u32, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.live_heart_rate_inner(key_hex, seconds, listener) => result,
+        }
+    }
 }
 
 impl RingSession {
@@ -661,6 +721,86 @@ impl RingSession {
         )
         .await;
         Ok(serial)
+    }
+
+    async fn live_heart_rate_inner(
+        &self,
+        key_hex: String,
+        seconds: u32,
+        listener: Box<dyn LiveHeartRateListener>,
+    ) -> Result<u32, SyncError> {
+        let fail = SyncError::Failed;
+        let key = parse_key(&key_hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let client = OuraClient::new(FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        });
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        let mut count = 0u32;
+        client
+            .live_heart_rate(std::time::Duration::from_secs(seconds as u64), false, |s| {
+                count += 1;
+                listener.on_beat(s.bpm, s.ibi_ms)
+            })
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        Ok(count)
+    }
+
+    async fn send_raw_inner(&self, key_hex: String, requests_hex: Vec<String>) -> Result<Vec<String>, SyncError> {
+        let fail = SyncError::Failed;
+        let key = parse_key(&key_hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let requests = requests_hex
+            .iter()
+            .map(|r| parse_hex(r).ok_or_else(|| fail(format!("not hex: {r}"))))
+            .collect::<Result<Vec<_>, _>>()?;
+        let transport = FfiTransport { tx: self.tx.clone(), writer: self.writer.clone() };
+        OuraClient::new(FfiTransport { tx: self.tx.clone(), writer: self.writer.clone() })
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        let mut lines = Vec::new();
+        for req in requests {
+            let frames = oura_link::transport::transact(&transport, &req, std::time::Duration::from_millis(1500))
+                .await
+                .map_err(|e| fail(e.to_string()))?;
+            let reply: Vec<String> = frames.iter().map(|f| bytes_hex(f)).collect();
+            lines.push(format!("{} -> {}", bytes_hex(&req), if reply.is_empty() { "(no reply)".into() } else { reply.join(" ") }));
+        }
+        Ok(lines)
+    }
+
+    async fn ensure_measurements_inner(&self, key_hex: String) -> Result<Vec<String>, SyncError> {
+        use oura_protocol::protocol::{feature, feature_mode};
+        let fail = SyncError::Failed;
+        let key = parse_key(&key_hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let client = OuraClient::new(FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        });
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        let mut enabled = Vec::new();
+        for (label, id) in [("daytime HR", feature::DAYTIME_HR), ("SpO2", feature::SPO2)] {
+            let on = client
+                .feature_status(id)
+                .await
+                .map(|s| s.mode == feature_mode::AUTOMATIC)
+                .unwrap_or(false);
+            if !on {
+                client
+                    .set_feature_mode(id, feature_mode::AUTOMATIC)
+                    .await
+                    .map_err(|e| fail(format!("enabling {label}: {e}")))?;
+                enabled.push(label.to_string());
+            }
+        }
+        Ok(enabled)
     }
 
     async fn pair_inner(
@@ -887,6 +1027,19 @@ fn to_hex(key: &[u8; 16]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn bytes_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Hex with any whitespace; None unless it is a non-empty, even run of hex digits.
+fn parse_hex(input: &str) -> Option<Vec<u8>> {
+    let hex: String = input.split_whitespace().collect();
+    if hex.is_empty() || hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect()
+}
+
 fn parse_key(hex: &str) -> Option<[u8; 16]> {
     let hex = hex.trim();
     if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -902,6 +1055,16 @@ fn parse_key(hex: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_spaced_hex_and_rejects_junk() {
+        assert_eq!(parse_hex("31 04 00 00 00 00"), Some(vec![0x31, 4, 0, 0, 0, 0]));
+        assert_eq!(parse_hex("2f0220"), Some(vec![0x2f, 2, 0x20]));
+        assert_eq!(parse_hex("abc"), None);
+        assert_eq!(parse_hex("zz"), None);
+        assert_eq!(parse_hex(""), None);
+        assert_eq!(bytes_hex(&[0x0a, 0xff]), "0aff");
+    }
 
     #[test]
     fn minted_keys_round_trip_through_hex() {

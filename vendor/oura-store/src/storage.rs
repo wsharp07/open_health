@@ -588,6 +588,19 @@ impl Store {
         Ok(rows)
     }
 
+    /// `(captured_unix, serial)` for every second that stored events. A sync talks to
+    /// one ring, so this tells which ring any event came from without carrying the
+    /// serial through `decoded_events`.
+    pub fn serials_by_capture(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT captured_unix, serial FROM events ORDER BY captured_unix")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Count stored events grouped by event name (descending).
     pub fn event_counts(&self, serial: &str) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
