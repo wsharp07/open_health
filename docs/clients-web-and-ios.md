@@ -169,6 +169,13 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
 - **Readiness** (`nights[].readiness`): an Oura-like score per main sleep with its
   contributors (`readiness.rs`); the Noura app renders it, the web and `OuraApp` don't.
 - **Ring serial per night** (`nights[].serial`): which ring measured the night.
+- **Sleep cycles, awakenings and heart-rate low** (`nights[].sleep_cycles`,
+  `nights[].wakes` with a likely `cause`, `nights[].hr_low_unix`): the Noura app renders
+  them; the web and `OuraApp` don't.
+- **Signal-estimated stages in a model-free build**: `build_summary` now fills any night
+  that neither the model runner nor the ring staged with `stage_night_from_signals`
+  (`staging_source: "signals"`), so `metrics`, `sleep_score` and `sleep_debt` exist
+  without a model. Both clients already draw `stages`; neither labels the source yet.
 
 ## Known gaps (web-only, not yet on iOS)
 

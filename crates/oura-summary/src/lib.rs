@@ -1293,32 +1293,49 @@ pub fn stage_nights_from_signals(db: &Path, sleep_ranges: &[[i64; 3]]) -> Option
         hr_t.sort_by_key(|&(ds, _)| ds);
         hrv_t.sort_by_key(|&(ds, _)| ds);
         motion_t.sort_by_key(|&(ds, _)| ds);
-        let stages = stage_night_from_signals(start_ds, end_ds, &hr_t, &hrv_t, &motion_t);
-        if stages.is_empty() {
-            results.push(Value::Null);
-            continue;
+        match signal_hypnogram(start_ds, end_ds, &hr_t, &hrv_t, &motion_t) {
+            Some(mut h) => {
+                h["start_ds"] = json!(start_ds);
+                h["end_ds"] = json!(end_ds);
+                h["captured_unix"] = json!(captured_unix);
+                results.push(h);
+            }
+            None => results.push(Value::Null),
         }
-        let n = stages.len() as f64;
-        let pct =
-            |code: i64| (stages.iter().filter(|&&c| c == code).count() as f64 / n * 100.0).round();
-        let asleep = stages.iter().filter(|&&c| (1..=3).contains(&c)).count() as f64;
-        results.push(json!({
-            "start_ds": start_ds,
-            "end_ds": end_ds,
-            "captured_unix": captured_unix,
-            "epochs": stages.len(),
-            "in_bed_min": n * 0.5,
-            "asleep_min": asleep * 0.5,
-            "efficiency_pct": (asleep / n * 100.0).round(),
-            "deep_pct": pct(1),
-            "light_pct": pct(2),
-            "rem_pct": pct(3),
-            "wake_pct": pct(4),
-            "source": "signals",
-            "stages": stages,
-        }));
     }
     Some(Value::Array(results))
+}
+
+/// One night's signal-estimated hypnogram in the shape the model runner returns
+/// (`stages` plus stage shares, `source: "signals"`), or `None` when the night is too
+/// short or has too few heart-rate samples to stage.
+fn signal_hypnogram(
+    start_ds: i64,
+    end_ds: i64,
+    hr_t: &[(i64, f64)],
+    hrv_t: &[(i64, f64)],
+    motion_t: &[(i64, f64)],
+) -> Option<Value> {
+    let stages = stage_night_from_signals(start_ds, end_ds, hr_t, hrv_t, motion_t);
+    if stages.is_empty() {
+        return None;
+    }
+    let n = stages.len() as f64;
+    let pct =
+        |code: i64| (stages.iter().filter(|&&c| c == code).count() as f64 / n * 100.0).round();
+    let asleep = stages.iter().filter(|&&c| (1..=3).contains(&c)).count() as f64;
+    Some(json!({
+        "epochs": stages.len(),
+        "in_bed_min": n * 0.5,
+        "asleep_min": asleep * 0.5,
+        "efficiency_pct": (asleep / n * 100.0).round(),
+        "deep_pct": pct(1),
+        "light_pct": pct(2),
+        "rem_pct": pct(3),
+        "wake_pct": pct(4),
+        "source": "signals",
+        "stages": stages,
+    }))
 }
 
 /// Nights the ring recorded but never declared.
@@ -1693,6 +1710,11 @@ fn count_bouts(seq: &[i64], code: i64, min_len: usize) -> u32 {
 /// Count periods of `code`, merging two runs separated by fewer than `merge_gap`
 /// non-`code` epochs into one, then keeping only merged periods of at least `min_len`.
 fn count_periods(seq: &[i64], code: i64, merge_gap: usize, min_len: usize) -> u32 {
+    periods(seq, code, merge_gap, min_len).len() as u32
+}
+
+/// The `(start, end)` epoch ranges [`count_periods`] counts.
+fn periods(seq: &[i64], code: i64, merge_gap: usize, min_len: usize) -> Vec<(usize, usize)> {
     // collect (start,end) runs of the code
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
@@ -1708,7 +1730,7 @@ fn count_periods(seq: &[i64], code: i64, merge_gap: usize, min_len: usize) -> u3
         }
     }
     if runs.is_empty() {
-        return 0;
+        return Vec::new();
     }
     // merge runs closer than merge_gap
     let mut merged: Vec<(usize, usize)> = vec![runs[0]];
@@ -1720,7 +1742,146 @@ fn count_periods(seq: &[i64], code: i64, merge_gap: usize, min_len: usize) -> u3
             merged.push((s, e));
         }
     }
-    merged.iter().filter(|(s, e)| e - s >= min_len).count() as u32
+    merged.retain(|(s, e)| e - s >= min_len);
+    merged
+}
+
+/// Sleep cycles as epoch ranges over a complete hypnogram: each cycle ends where a REM
+/// period ends (REM merged and filtered exactly as `sleep_metrics` counts `cycles`), the
+/// first starts at sleep onset, and sleep after the last REM period joins the last cycle.
+fn cycle_ranges(stages: &[i64], epoch_min: f64) -> Vec<(usize, usize)> {
+    let is_sleep = |c: i64| (1..=3).contains(&c);
+    let (Some(onset), Some(last)) = (
+        stages.iter().position(|&c| is_sleep(c)),
+        stages.iter().rposition(|&c| is_sleep(c)),
+    ) else {
+        return Vec::new();
+    };
+    let merge_gap = ((15.0 / epoch_min).round() as usize).max(1);
+    let min_rem = ((3.0 / epoch_min).ceil() as usize).max(1);
+    let rem = periods(&stages[onset..=last], 3, merge_gap, min_rem);
+    let mut out = Vec::with_capacity(rem.len());
+    let mut start = onset;
+    for (i, &(_, end)) in rem.iter().enumerate() {
+        let end = if i + 1 == rem.len() {
+            last + 1
+        } else {
+            onset + end
+        };
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
+/// Per-cycle detail for the night screen: when each cycle ran and minutes per stage.
+/// `at` maps seconds from the start of the window to unix seconds.
+fn sleep_cycles(stages: &[i64], in_bed_s: f64, at: impl Fn(f64) -> f64) -> Value {
+    let n = stages.len();
+    if n == 0 || stages.iter().any(|c| !(1..=4).contains(c)) {
+        return Value::Null;
+    }
+    let epoch_s = in_bed_s / n as f64;
+    let epoch_min = epoch_s / 60.0;
+    let minutes = |r: &[i64], code: i64| {
+        (r.iter().filter(|&&c| c == code).count() as f64 * epoch_min * 10.0).round() / 10.0
+    };
+    Value::Array(
+        cycle_ranges(stages, epoch_min)
+            .into_iter()
+            .map(|(s, e)| {
+                let r = &stages[s..e];
+                json!({
+                    "start_unix": at(s as f64 * epoch_s).round() as i64,
+                    "end_unix": at(e as f64 * epoch_s).round() as i64,
+                    "deep_min": minutes(r, 1),
+                    "light_min": minutes(r, 2),
+                    "rem_min": minutes(r, 3),
+                    "wake_min": minutes(r, 4),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Awakenings of at least two minutes inside the sleep period, each with its most
+/// likely trigger: `"movement"` (a large motion window around its start), `"heart"`
+/// (heart rate climbed ≥5 bpm over the preceding half hour's median without much
+/// movement), `"cycle"` (it follows REM, the usual end of a cycle), else `"quiet"`.
+fn wake_bouts(
+    stages: &[i64],
+    start_ds: i64,
+    end_ds: i64,
+    hr_t: &[(i64, f64)],
+    motion_t: &[(i64, f64)],
+    at_ds: impl Fn(i64) -> f64,
+) -> Value {
+    let n = stages.len();
+    if n == 0 || end_ds <= start_ds || stages.iter().any(|c| !(1..=4).contains(c)) {
+        return Value::Null;
+    }
+    let is_sleep = |c: i64| (1..=3).contains(&c);
+    let (Some(onset), Some(last)) = (
+        stages.iter().position(|&c| is_sleep(c)),
+        stages.iter().rposition(|&c| is_sleep(c)),
+    ) else {
+        return json!([]);
+    };
+    let epoch_ds = (end_ds - start_ds) as f64 / n as f64;
+    let min_len = ((1200.0 / epoch_ds).ceil() as usize).max(1); // two minutes
+    let in_window = |pts: &[(i64, f64)], lo: i64, hi: i64| -> Vec<f64> {
+        pts.iter()
+            .filter(|&&(ds, v)| ds >= lo && ds <= hi && v > 0.0)
+            .map(|&(_, v)| v)
+            .collect()
+    };
+    let mut out = Vec::new();
+    let mut i = onset;
+    while i <= last {
+        if stages[i] != 4 {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i <= last && stages[i] == 4 {
+            i += 1;
+        }
+        if i - s < min_len {
+            continue;
+        }
+        let ds = start_ds + (s as f64 * epoch_ds).round() as i64;
+        let moved = in_window(motion_t, ds - 1200, ds + 1200)
+            .iter()
+            .any(|&m| m >= 8.0);
+        let heart = {
+            let mut before = in_window(hr_t, ds - 18_000, ds - 6_000);
+            let around = in_window(hr_t, ds - 6_000, ds + 1_200);
+            before.sort_by(f64::total_cmp);
+            match (
+                before.get(before.len() / 2),
+                around.iter().cloned().reduce(f64::max),
+            ) {
+                (Some(&median), Some(peak)) => peak - median >= 5.0,
+                _ => false,
+            }
+        };
+        let after_rem = stages[s.saturating_sub(4)..s].contains(&3);
+        let cause = if moved {
+            "movement"
+        } else if heart {
+            "heart"
+        } else if after_rem {
+            "cycle"
+        } else {
+            "quiet"
+        };
+        out.push(json!({
+            "start_unix": at_ds(ds).round() as i64,
+            "minutes": ((i - s) as f64 * epoch_ds / 600.0 * 10.0).round() / 10.0,
+            "cause": cause,
+        }));
+    }
+    Value::Array(out)
 }
 
 /// Science-based per-night sleep metrics derived from the model hypnogram (per-epoch
@@ -2388,6 +2549,19 @@ pub fn build_summary(
     for (start_ds, hypnogram) in ring_hypnograms(&ring_sleeps, &nights, unix_s_at) {
         hyps.entry(start_ds).or_insert(hypnogram);
     }
+    // Neither a model nor the ring staged these nights: estimate the stages from the
+    // night's own HR, HRV and motion, so a model-free client still gets a hypnogram.
+    // Marked `source: "signals"`; sleep vs wake is the trustworthy part of it.
+    for nt in &nights {
+        let key = (nt.start_ds, nt.captured_unix);
+        if hyps.contains_key(&key) {
+            continue;
+        }
+        if let Some(h) = signal_hypnogram(nt.start_ds, nt.end_ds, &nt.hr_t, &nt.hrv_t, &nt.motion_t)
+        {
+            hyps.insert(key, h);
+        }
+    }
 
     nights.sort_by(|a, b| {
         unix_s_at(a.start_ds, a.captured_unix)
@@ -2534,6 +2708,24 @@ pub fn build_summary(
             None
         };
         let wake_ymd = Some(ymd_label(end_unix, tz));
+        let cycles = sleep_cycles(&full_stages, in_bed_s, |s| {
+            unix_s_at(nt.start_ds + (s * 10.0).round() as i64, nt.captured_unix)
+        });
+        let wakes = wake_bouts(
+            &full_stages,
+            nt.start_ds,
+            nt.end_ds,
+            &nt.hr_t,
+            &nt.motion_t,
+            |ds| unix_s_at(ds, nt.captured_unix),
+        );
+        // When the heart reached its lowest; a late low is a sign the body was still busy.
+        let hr_low_unix = nt
+            .hr_t
+            .iter()
+            .filter(|&&(ds, v)| v > 30.0 && ds >= nt.start_ds && ds <= nt.end_ds)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|&(ds, _)| unix_s_at(ds, nt.captured_unix).round() as i64);
         nights_json.push(json!({
             "date": date_label(start_unix, tz),
             "ymd": ymd_label(start_unix, tz),
@@ -2616,6 +2808,14 @@ pub fn build_summary(
             // the ring that measured this night, so baselines can stay on one ring
             "serial": serial_at.get(&nt.captured_unix),
         }));
+        // Added after the literal, which is at serde_json's macro recursion limit.
+        if let Some(night) = nights_json.last_mut() {
+            // the cycles `metrics.cycles` counts, with times and minutes per stage
+            night["sleep_cycles"] = cycles;
+            // awakenings of 2+ min inside the sleep period, each with its likely trigger
+            night["wakes"] = wakes;
+            night["hr_low_unix"] = json!(hr_low_unix);
+        }
         let lowest_hr_unix = nt
             .hr_t
             .iter()
@@ -4123,5 +4323,120 @@ mod tests {
             late_rem_false_deep, 0,
             "late-night REM HRV surge (epochs 570..620) must not be misclassified as N3 deep sleep"
         );
+    }
+
+    /// Build a 30 s hypnogram from (code, minutes) runs.
+    fn hypno(runs: &[(i64, usize)]) -> Vec<i64> {
+        runs.iter()
+            .flat_map(|&(c, m)| std::iter::repeat(c).take(m * 2))
+            .collect()
+    }
+
+    #[test]
+    fn sleep_cycles_end_at_rem_and_match_the_cycle_count() {
+        let stages = hypno(&[
+            (4, 12),
+            (2, 14),
+            (1, 38),
+            (2, 16),
+            (3, 10),
+            (2, 20),
+            (1, 28),
+            (2, 14),
+            (3, 18),
+            (4, 3),
+            (2, 30),
+            (1, 12),
+            (2, 20),
+            (3, 24),
+            (2, 40),
+            (3, 23),
+            (2, 38),
+            (4, 12),
+        ]);
+        let in_bed_s = stages.len() as f64 * 30.0;
+        let cycles = sleep_cycles(&stages, in_bed_s, |s| 1_000.0 + s);
+        let arr = cycles.as_array().unwrap();
+        let (metrics, _) = sleep_metrics(&stages, in_bed_s);
+        assert_eq!(arr.len() as u64, metrics["cycles"].as_u64().unwrap());
+        assert_eq!(arr.len(), 4);
+        // first cycle starts at sleep onset (12 min) and ends with the first REM (90 min)
+        assert_eq!(arr[0]["start_unix"], json!(1_000 + 12 * 60));
+        assert_eq!(arr[0]["end_unix"], json!(1_000 + 90 * 60));
+        assert_eq!(arr[0]["deep_min"], json!(38.0));
+        assert_eq!(arr[0]["rem_min"], json!(10.0));
+        // cycles tile onset → final sleep with no gaps
+        for w in arr.windows(2) {
+            assert_eq!(w[0]["end_unix"], w[1]["start_unix"]);
+        }
+        // the light tail after the last REM joins the last cycle; trailing wake does not
+        let total_min = stages.len() as i64 / 2;
+        assert_eq!(arr[3]["end_unix"], json!(1_000 + (total_min - 12) * 60));
+    }
+
+    #[test]
+    fn sleep_cycles_need_a_complete_hypnogram() {
+        assert!(sleep_cycles(&[2, 0, 3], 90.0, |s| s).is_null());
+        assert!(sleep_cycles(&[], 0.0, |s| s).is_null());
+        assert_eq!(
+            sleep_cycles(&hypno(&[(2, 60), (1, 30)]), 5_400.0, |s| s),
+            json!([])
+        );
+    }
+
+    #[test]
+    fn wake_bouts_name_their_likely_trigger() {
+        // 30 s epochs from ds 0; wakes at 60 min (after REM), 120 min (movement),
+        // 180 min (heart rate rise), 240 min (nothing); a 1 min flicker is ignored.
+        let stages = hypno(&[
+            (4, 5),
+            (2, 45),
+            (3, 10),
+            (4, 4),
+            (2, 56),
+            (4, 3),
+            (2, 57),
+            (4, 3),
+            (2, 57),
+            (4, 3),
+            (2, 20),
+            (4, 1),
+            (2, 30),
+            (4, 5),
+        ]);
+        let end_ds = stages.len() as i64 * 300;
+        let min = |m: i64| m * 600;
+        let motion = vec![(min(121), 20.0)];
+        let mut hr: Vec<(i64, f64)> = (0..60).map(|i| (min(i * 5), 50.0)).collect();
+        hr.push((min(178), 58.0));
+        hr.sort_by_key(|p| p.0);
+        let wakes = wake_bouts(&stages, 0, end_ds, &hr, &motion, |ds| ds as f64 / 10.0);
+        let arr = wakes.as_array().unwrap();
+        let causes: Vec<&str> = arr.iter().map(|w| w["cause"].as_str().unwrap()).collect();
+        assert_eq!(causes, ["cycle", "movement", "heart", "quiet"]);
+        assert_eq!(arr[0]["start_unix"], json!(60 * 60));
+        assert_eq!(arr[0]["minutes"], json!(4.0));
+    }
+
+    #[test]
+    fn signal_hypnogram_is_marked_and_skips_unstageable_nights() {
+        assert!(signal_hypnogram(0, 600, &[], &[], &[]).is_none());
+        let start = 0i64;
+        let end = 8 * 36_000;
+        let hr: Vec<(i64, f64)> = (0..96)
+            .map(|i| {
+                (
+                    i * 3_000,
+                    55.0 - 10.0 * ((i as f64) / 95.0 * std::f64::consts::PI).sin(),
+                )
+            })
+            .collect();
+        let hrv: Vec<(i64, f64)> = hr.iter().map(|&(ds, v)| (ds, 120.0 - v)).collect();
+        let h = signal_hypnogram(start, end, &hr, &hrv, &[]).expect("staged");
+        assert_eq!(h["source"], json!("signals"));
+        let stages = h["stages"].as_array().unwrap();
+        assert!(stages
+            .iter()
+            .all(|c| (1..=4).contains(&c.as_i64().unwrap())));
     }
 }
