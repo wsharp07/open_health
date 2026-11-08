@@ -14,6 +14,7 @@
 
 pub mod hourly_hr;
 pub mod readiness;
+pub mod research_export;
 pub mod ring_time;
 pub mod sleep_score;
 pub mod symptoms;
@@ -290,6 +291,64 @@ fn offset_seconds(tz: f64) -> i64 {
     (tz * 3600.0).round() as i64
 }
 
+/// Ring deciseconds of element `i` of `len` interval-averaged samples (HR/HRV)
+/// packed under ONE event whose ring timestamp `packet_ds` marks the packet.
+///
+/// The ring stamps the packet at its LAST (newest) sample and the averages lead up
+/// to it, so the array ends — it does not start — at `packet_ds`: element `i` sits
+/// `(len - 1 - i) * step_ds` deciseconds *before* it. This is the same timing rule
+/// `research_export::beat_times` uses for the raw beat stream (packet stamp = last
+/// beat, walk back). Placing the array *forward* from `packet_ds` instead would put
+/// the newest sample up to a whole packet-span into the future of its own emission
+/// and shift the nocturnal HR/HRV series late by that span (≈30 min for a 7-sample
+/// 5-minute packet), desynchronising it from the motion stream and the hypnogram.
+pub(crate) fn packed_sample_ds(packet_ds: i64, i: usize, len: usize, step_ds: i64) -> i64 {
+    packet_ds - (len as i64 - 1 - i as i64) * step_ds
+}
+
+/// Timestamped `(sample_ds, value)` pairs for a packed HR/HRV array under one event.
+///
+/// Samples are `step_ds` deciseconds apart and the array *ends* at `packet_ds`
+/// (walk back — see [`packed_sample_ds`]). `step_ds` is the spacing: the firmware's
+/// `interval_min` averages use `interval_min * 600`; a burst that all shares the
+/// packet stamp (green-LED beat estimates) passes `0`. Non-numeric entries are
+/// skipped; value thresholds (e.g. `> 0`, physiologic range) stay at the call site.
+pub(crate) fn packed_series<'a>(
+    packet_ds: i64,
+    arr: &'a [Value],
+    step_ds: i64,
+) -> impl Iterator<Item = (i64, f64)> + 'a {
+    let len = arr.len();
+    arr.iter()
+        .enumerate()
+        .filter_map(move |(i, x)| x.as_f64().map(|v| (packed_sample_ds(packet_ds, i, len, step_ds), v)))
+}
+
+/// Decisecond spacing of a firmware `hrv_event`'s packed averages (`interval_min`
+/// minutes apart, default 5), for [`packed_series`].
+pub(crate) fn hrv_step_ds(v: &Value) -> i64 {
+    v["interval_min"].as_i64().unwrap_or(5).max(1) * 600
+}
+
+/// Whether a newly-seen battery reading should become the headline pick.
+///
+/// The debug_data events are not strictly time-ordered (sync replays, multi-boot
+/// epochs), so the last one iterated is not necessarily the most recent — taking it
+/// blindly mis-dated `battery_recorded` / `battery_fresh_hours`. Prefer the newest
+/// *dated* reading by wall-clock; before any dated reading appears keep the
+/// last-seen (undated) one; never let an undated reading override a dated one.
+/// `new_unix` is the candidate's wall-clock (None = undated), `best_dated_unix` the
+/// wall-clock of the current dated pick (None = none chosen yet).
+fn prefer_battery_reading(new_unix: Option<f64>, best_dated_unix: Option<f64>) -> bool {
+    match (new_unix, best_dated_unix) {
+        (Some(u), Some(best)) => u >= best,
+        (Some(_), None) => true,
+        (None, None) => true,
+        (None, Some(_)) => false,
+    }
+}
+
+
 fn date_label(unix_s: f64, tz: impl Into<OffsetHours>) -> String {
     let tz = tz.into().0;
     let days = (unix_s as i64 + offset_seconds(tz)).div_euclid(86400);
@@ -461,24 +520,20 @@ fn median_of(values: &[f64]) -> Option<f64> {
     })
 }
 
-/// The `(window start ds, hr_bpm, rmssd_ms)` samples of one `hrv_event`. The ring
-/// writes the event when a block of `interval_min`-minute averages closes (or early,
-/// part-full, when a sync asks for history), so its timestamp is the END of the last
-/// window: element i of n starts (n − i)·interval before it. Against a Ring 4's
-/// beat-to-beat stream this places HR within 0.5–1 bpm; read as start-of-block it is
-/// 4–7 bpm off and half an hour late. Zero means no reading and comes back as `None`.
+/// The `(sample ds, hr_bpm, rmssd_ms)` samples of one `hrv_event`, on the same timing
+/// rule as [`packed_series`]: the packet's stamp is its last sample and the
+/// `interval_min` averages walk back from it. HR and RMSSD share one index, so each
+/// sample can find its own night (a block can straddle bedtime or waking). Zero means
+/// no reading and comes back as `None`.
 pub(crate) fn hrv_samples(event_ds: i64, v: &Value) -> Vec<(i64, Option<f64>, Option<f64>)> {
-    let step_ds = v["interval_min"].as_i64().unwrap_or(5).max(1) * 600;
+    let step_ds = hrv_step_ds(v);
     let empty = Vec::new();
     let hr = v["hr_bpm"].as_array().unwrap_or(&empty);
     let rmssd = v["rmssd_ms"].as_array().unwrap_or(&empty);
     let n = hr.len().max(rmssd.len());
     let reading = |a: &Vec<Value>, i: usize| a.get(i).and_then(Value::as_f64).filter(|&x| x > 0.0);
     (0..n)
-        .map(|i| {
-            let start_ds = event_ds - (n - i) as i64 * step_ds;
-            (start_ds, reading(hr, i), reading(rmssd, i))
-        })
+        .map(|i| (packed_sample_ds(event_ds, i, n, step_ds), reading(hr, i), reading(rmssd, i)))
         .collect()
 }
 
@@ -1262,8 +1317,8 @@ pub fn stage_nights_from_signals(db: &Path, sleep_ranges: &[[i64; 3]]) -> Option
         let in_range = |ds: i64| start_ds - 600 <= ds && ds <= end_ds + 600;
         for (ds, tag, jstr, _cu) in &events {
             if *tag == 0x5d {
-                // Judge each sample by its own window: the event's timestamp is the end
-                // of a block that can reach half an hour back (see `hrv_samples`).
+                // Judge each sample by its own time: one event's averages can reach half an
+                // hour back from its stamp (see `hrv_samples`).
                 if let Ok(v) = serde_json::from_str::<Value>(jstr) {
                     for (sample_ds, hr, rmssd) in hrv_samples(*ds, &v) {
                         if !in_range(sample_ds) {
@@ -2003,6 +2058,44 @@ fn feat(name: &str, on: bool, feature: &str) -> Value {
 /// Mode filter over a centered odd window — removes single-epoch flicker from the
 /// model hypnogram so cycle/awakening counts reflect real architecture, not 30 s noise
 /// (clinical scoring smooths the same way before deriving events).
+/// Hypnograms that come from Oura's own staging and must be shown as-is:
+/// `nssa` (the official app's sleepstaging model) and `ring` (the ring's own
+/// `sleep_phase_data`). Mirrors `Sleep.isOuraStaging` in Reports.swift.
+pub fn is_oura_staging(source: Option<&str>) -> bool {
+    matches!(source, Some("nssa") | Some("ring"))
+}
+
+/// Android `SleepPhaseConverter.aggregate30SecTo5Min` (7.18.0), what the official
+/// sleep chart draws: drop codes outside 1..=4, cut into 10-epoch windows (the last
+/// one partial), skip windows under 5 epochs, AWAKE when it holds >= 4 awake epochs,
+/// otherwise the most frequent stage with ties going AWAKE > DEEP > REM > LIGHT.
+/// Mirrors `Sleep.aggregate5Min` in Reports.swift.
+pub fn aggregate_30s_to_5min(stages: &[i64]) -> Vec<i64> {
+    let codes: Vec<i64> = stages
+        .iter()
+        .copied()
+        .filter(|c| (1..=4).contains(c))
+        .collect();
+    codes
+        .chunks(10)
+        .filter(|w| w.len() >= 5)
+        .map(|w| {
+            let mut counts = [0usize; 5];
+            for &c in w {
+                counts[c as usize] += 1;
+            }
+            if counts[4] >= 4 {
+                return 4;
+            }
+            let max = counts[1..].iter().copied().max().unwrap_or(0);
+            [4, 1, 3, 2]
+                .into_iter()
+                .find(|&c| counts[c as usize] >= max)
+                .unwrap_or(4)
+        })
+        .collect()
+}
+
 fn smooth_stages(vals: &[i64], win: usize) -> Vec<i64> {
     if vals.len() < win || win < 3 {
         return vals.to_vec();
@@ -2606,10 +2699,19 @@ pub fn build_summary(
             .and_then(|h| h["stages"].as_array())
             .map(|s| s.iter().filter_map(|x| x.as_i64()).collect())
             .unwrap_or_default();
-        // smooth once (≈2.5 min window) — used for the displayed hypnogram AND the
-        // derived metrics, so the two always agree.
-        let mut full_stages = smooth_stages(&raw_stages, 5);
-        if !full_stages.is_empty()
+        // Oura's own hypnograms (NSSA on the phone, or the ring's sleep_phase_data) are
+        // shown verbatim: the official app neither smooths them again nor invents deep
+        // sleep. Only our signal-derived estimate gets the ≈2.5 min majority filter and
+        // the N3 recovery, for the displayed hypnogram AND the derived metrics alike.
+        let staging_source = hyp.and_then(|h| h["source"].as_str());
+        let oura_stages = is_oura_staging(staging_source);
+        let mut full_stages = if oura_stages {
+            raw_stages.clone()
+        } else {
+            smooth_stages(&raw_stages, 5)
+        };
+        if !oura_stages
+            && !full_stages.is_empty()
             && !full_stages.contains(&1)
             && hyp.and_then(|h| h["deep_pct"].as_f64()).unwrap_or(0.0) == 0.0
             && nt.hr_t.len() >= 12
@@ -2726,7 +2828,14 @@ pub fn build_summary(
             .filter(|&&(ds, v)| v > 30.0 && ds >= nt.start_ds && ds <= nt.end_ds)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|&(ds, _)| unix_s_at(ds, nt.captured_unix).round() as i64);
-        nights_json.push(json!({
+        // The official app's main hypnogram: the 30 s stages folded into 5-minute
+        // blocks (Android `SleepPhaseConverter.aggregate30SecTo5Min`).
+        let stages_5min = (oura_stages && !full_stages.is_empty())
+            .then(|| aggregate_30s_to_5min(&full_stages));
+        // Wall-clock start (unix s) of stages_full[0] when the stager reports it: NSSA
+        // epochs sit on the 30 s grid floor30(bedtime start), not on start_ds.
+        let stages_t0_unix = hyp.and_then(|h| h["stages_t0_unix"].as_f64());
+        let mut night_json = json!({
             "date": date_label(start_unix, tz),
             "ymd": ymd_label(start_unix, tz),
             // The morning you woke up: what the apps group a night under. Computed
@@ -2758,7 +2867,7 @@ pub fn build_summary(
             "wake_pct": wake_pct_val,
             "efficiency": hyp.map(|h| h["efficiency_pct"].clone()),
             "stages": stage_cells,
-            "staging_source": hyp.and_then(|h| h["source"].as_str()),
+            "staging_source": staging_source,
             "staging_coverage_pct": coverage_pct,
             "staging_complete": complete_staging,
             "captured_unix": nt.captured_unix,
@@ -2805,17 +2914,17 @@ pub fn build_summary(
                 age: demo.age,
             }) } else { Value::Null },
             "breath_rate": night_breath.map(|b| (b * 10.0).round() / 10.0),
-            // the ring that measured this night, so baselines can stay on one ring
-            "serial": serial_at.get(&nt.captured_unix),
-        }));
-        // Added after the literal, which is at serde_json's macro recursion limit.
-        if let Some(night) = nights_json.last_mut() {
-            // the cycles `metrics.cycles` counts, with times and minutes per stage
-            night["sleep_cycles"] = cycles;
-            // awakenings of 2+ min inside the sleep period, each with its likely trigger
-            night["wakes"] = wakes;
-            night["hr_low_unix"] = json!(hr_low_unix);
-        }
+        });
+        night_json["stages_5min"] = json!(stages_5min);
+        night_json["stages_t0_unix"] = json!(stages_t0_unix);
+        // the ring that measured this night, so baselines can stay on one ring
+        night_json["serial"] = json!(serial_at.get(&nt.captured_unix));
+        // the cycles `metrics.cycles` counts, with times and minutes per stage
+        night_json["sleep_cycles"] = cycles;
+        // awakenings of 2+ min inside the sleep period, each with its likely trigger
+        night_json["wakes"] = wakes;
+        night_json["hr_low_unix"] = json!(hr_low_unix);
+        nights_json.push(night_json);
         let lowest_hr_unix = nt
             .hr_t
             .iter()
@@ -3127,15 +3236,24 @@ pub fn build_summary(
         ),
         insight("Stress / resilience", false, "needs cloud scores"),
     ]);
-    let mut battery: Option<(i64, i64)> = None;
+    let mut battery: Option<(i64, i64, Option<f64>)> = None;
+    let mut battery_best_unix: Option<f64> = None;
     let mut battery_readings: Vec<(f64, i64)> = Vec::new();
     for (ds, tag, jstr, cu) in &events {
         if name_of(*tag) == "debug_data" && jstr.contains("battery_pct") {
             if let Ok(v) = serde_json::from_str::<Value>(jstr) {
                 if let Some(p) = v["battery_pct"].as_i64() {
-                    battery = Some((p, v["voltage_mv"].as_i64().unwrap_or(0)));
-                    if (0..=100).contains(&p) && is_dated(*ds, *cu) {
-                        battery_readings.push((unix_s_at(*ds, *cu), p));
+                    let b_unix = is_dated(*ds, *cu).then(|| unix_s_at(*ds, *cu));
+                    if prefer_battery_reading(b_unix, battery_best_unix) {
+                        battery = Some((p, v["voltage_mv"].as_i64().unwrap_or(0), b_unix));
+                        if b_unix.is_some() {
+                            battery_best_unix = b_unix;
+                        }
+                    }
+                    if let Some(u) = b_unix {
+                        if (0..=100).contains(&p) {
+                            battery_readings.push((u, p));
+                        }
                     }
                 }
             }
@@ -3169,6 +3287,9 @@ pub fn build_summary(
         "nights": nights.len(),
         "battery_pct": battery.map(|b| b.0),
         "battery_v": battery.map(|b| (b.1 as f64 / 1000.0 * 100.0).round() / 100.0),
+        "battery_recorded": battery.and_then(|b| b.2).map(|u| date_label(u, tz)),
+        "battery_recorded_hm": battery.and_then(|b| b.2).map(|u| hm(u, tz)),
+        "battery_fresh_hours": battery.and_then(|b| b.2).map(|u| ((now - u) / 3600.0 * 10.0).round() / 10.0),
         // [unix_s, percent] readings for the battery chart; see `battery_history`
         "battery_history": battery_history(&battery_readings, BATTERY_HISTORY_DAYS),
         "measuring": measuring,
@@ -3292,6 +3413,75 @@ pub fn build_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn battery_headline_prefers_the_newest_dated_reading() {
+        // A newer dated reading wins; an older dated one does not.
+        assert!(prefer_battery_reading(Some(200.0), Some(100.0)));
+        assert!(prefer_battery_reading(Some(100.0), Some(100.0))); // ties take the later-iterated
+        assert!(!prefer_battery_reading(Some(50.0), Some(100.0)));
+        // The first dated reading beats a provisional undated pick.
+        assert!(prefer_battery_reading(Some(100.0), None));
+        // Before any dated reading, keep following the last-seen undated one.
+        assert!(prefer_battery_reading(None, None));
+        // An undated reading must never override a dated pick (the replay-safety case).
+        assert!(!prefer_battery_reading(None, Some(100.0)));
+    }
+
+    #[test]
+    fn signal_staging_fills_a_resolved_night_with_5min_physiology() {
+        // Characterization of the fallback the web dashboard relies on when the model
+        // can't stage a night: a resolved 8.4 h window carrying HR/HRV/motion must come
+        // back as a full per-epoch hypnogram with some sleep, never blank. Reproduces
+        // the *shape* only (5-min-spaced samples, quiet but for a few movement bursts),
+        // not any real recording. (The estimator itself is exercised elsewhere; this
+        // pins "not blank", which is the behaviour the dashboard fix depends on.)
+        let start_ds = 0i64;
+        let end_ds = 302_400i64; // 8.4 h in deciseconds
+        let step = 3_000i64; // 5 min
+        let mut hr_t = Vec::new();
+        let mut hrv_t = Vec::new();
+        let mut motion_t = Vec::new();
+        for (i, ds) in (start_ds..=end_ds).step_by(step as usize).enumerate() {
+            // HR dips mid-night, HRV rises mid-night (a sleep-like autonomic profile).
+            let phase = (ds - start_ds) as f64 / (end_ds - start_ds) as f64;
+            hr_t.push((ds, 56.0 - 10.0 * (phase * std::f64::consts::PI).sin()));
+            hrv_t.push((ds, 45.0 + 30.0 * (phase * std::f64::consts::PI).sin()));
+            let mo = if i % 37 == 0 { 9.0 } else { 1.0 }; // mostly still, brief arousals
+            motion_t.push((ds, mo));
+        }
+        let stages = stage_night_from_signals(start_ds, end_ds, &hr_t, &hrv_t, &motion_t);
+        // One cell per 30 s epoch across the whole window — the night is not blank.
+        assert_eq!(stages.len(), ((end_ds - start_ds) / 300) as usize);
+        // And some of it is scored as sleep rather than all wake (the reported bug left
+        // the night with no sleep at all). Which sleep stage is the estimator's call.
+        assert!(
+            stages.iter().any(|&c| (1..=3).contains(&c)),
+            "a quiet low-HR night must score at least some sleep, not all wake"
+        );
+    }
+
+    #[test]
+    fn packed_samples_walk_back_from_the_packet_stamp() {
+        // A packet's ring timestamp marks its LAST (newest) sample; earlier averages
+        // precede it by one step each. The newest must land exactly on the stamp and
+        // none may fall after it (a packet cannot carry a sample from its own future).
+        let packet_ds = 1_000_000;
+        let step_ds = 5 * 600; // a 5-minute average, in deciseconds
+        let len = 7; // the nocturnal HR/HRV stream packs 7 (see research_export)
+        let placed: Vec<i64> = (0..len)
+            .map(|i| packed_sample_ds(packet_ds, i, len, step_ds))
+            .collect();
+        assert_eq!(*placed.last().unwrap(), packet_ds, "newest sample is the stamp");
+        assert!(placed.iter().all(|&ds| ds <= packet_ds), "none after the stamp");
+        // Maxime's case: 7 five-minute averages span exactly 30 minutes ending at the
+        // stamp. The old forward placement put the oldest here and the newest 30 min
+        // late — the +30 min heart-rate shift he reported.
+        assert_eq!(placed[0], packet_ds - 30 * 60 * 10);
+        // A single-sample packet (or a beat event with step 0) sits on the stamp.
+        assert_eq!(packed_sample_ds(packet_ds, 0, 1, step_ds), packet_ds);
+        assert_eq!(packed_sample_ds(packet_ds, 0, 1, 0), packet_ds);
+    }
 
     #[test]
     fn fractional_timezone_preserves_minutes_and_day_boundaries() {
@@ -3427,6 +3617,33 @@ mod tests {
         let compact = downsample_codes(&smoothed, 120);
         assert!(compact[..60].iter().all(|&c| c == 0));
         assert_eq!(sleep_metrics(&smoothed, 8.0 * 3600.0), (Value::Null, 0));
+    }
+
+    #[test]
+    fn five_minute_blocks_follow_the_android_converter() {
+        // 4 awake epochs force AWAKE even when light dominates.
+        assert_eq!(aggregate_30s_to_5min(&[2, 2, 2, 2, 2, 2, 4, 4, 4, 4]), vec![4]);
+        // ties go AWAKE > DEEP > REM > LIGHT; 3 awake epochs do not force AWAKE.
+        assert_eq!(aggregate_30s_to_5min(&[2, 2, 2, 1, 1, 1, 4, 4, 4, 3]), vec![4]);
+        assert_eq!(aggregate_30s_to_5min(&[2, 2, 2, 1, 1, 1, 4, 4, 3, 3]), vec![1]);
+        assert_eq!(aggregate_30s_to_5min(&[2, 2, 2, 2, 3, 3, 3, 3, 1, 4]), vec![3]);
+        // a trailing window keeps >= 5 epochs, shorter tails are dropped, and
+        // unknown (0) epochs are removed before windowing like Character.digit-less
+        // codes on Android.
+        let mut night = vec![1; 10];
+        night.extend([0, 0]);
+        night.extend([3; 5]);
+        assert_eq!(aggregate_30s_to_5min(&night), vec![1, 3]);
+        assert_eq!(aggregate_30s_to_5min(&[2; 14]), vec![2]);
+        assert!(aggregate_30s_to_5min(&[]).is_empty());
+    }
+
+    #[test]
+    fn oura_hypnograms_are_not_smoothed_or_refined() {
+        assert!(is_oura_staging(Some("nssa")));
+        assert!(is_oura_staging(Some("ring")));
+        assert!(!is_oura_staging(Some("signals")));
+        assert!(!is_oura_staging(None));
     }
 
     #[test]
@@ -4160,16 +4377,16 @@ mod tests {
         assert_eq!(
             hrv_samples(30_000, &v),
             vec![
-                (21_000, Some(70.0), Some(20.0)),
-                (24_000, None, Some(21.0)),
-                (27_000, Some(72.0), None),
+                (24_000, Some(70.0), Some(20.0)),
+                (27_000, None, Some(21.0)),
+                (30_000, Some(72.0), None),
             ]
         );
         // a part-full block flushed by a sync still ends at its own timestamp
         let partial = json!({ "hr_bpm": [68], "rmssd_ms": [27] });
         assert_eq!(
             hrv_samples(30_000, &partial),
-            vec![(27_000, Some(68.0), Some(27.0))]
+            vec![(30_000, Some(68.0), Some(27.0))]
         );
     }
 
@@ -4212,16 +4429,16 @@ mod tests {
             "bedtime_period",
             "{\"bedtime_start_ds\":10000,\"bedtime_end_ds\":298000}".into(),
         );
-        // windows start at -5 000 … 10 000: only the last (10 000–13 000) is in bed
+        // samples at -5 000 … 10 000 (the stamp is the last): only 10 000 is in bed
         insert(
-            13_000,
+            10_000,
             93,
             "hrv_event",
             "{\"hr_bpm\":[90,90,90,90,90,60],\"rmssd_ms\":[9,9,9,9,9,30]}".into(),
         );
-        // windows start at 286 000 … 301 000: all but the last are in bed
+        // samples at 286 000 … 301 000: all but the last are in bed
         insert(
-            304_000,
+            301_000,
             93,
             "hrv_event",
             "{\"hr_bpm\":[55,50,55,55,55,40],\"rmssd_ms\":[30,30,30,30,30,9]}".into(),

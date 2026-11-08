@@ -1381,6 +1381,31 @@ fileprivate struct FfiConverterSequenceUInt16: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_MAYBE_READY: Int8 = 1
 
@@ -1426,6 +1451,17 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
     } else {
         print("uniffiFutureContinuationCallback invalid handle")
     }
+}
+/**
+ * Record a research "mark now" at the phone's current time; returns that unix time.
+ */
+public func addResearchMarker(dbPath: String, label: String)throws  -> Double {
+    return try  FfiConverterDouble.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_oura_core_fn_func_add_research_marker(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(label),$0
+    )
+})
 }
 /**
  * Write a clean single-file copy of the database to `dest_path` — the export half of
@@ -1534,6 +1570,23 @@ public func quickSummaryJson(dbPath: String) -> String {
 })
 }
 /**
+ * Write the research export (raw per-beat / per-window CSVs for
+ * `[start_unix, end_unix)`, see `oura_summary::research_export`) as a ZIP into
+ * `out_dir` and return its path. Same bytes as the web dashboard and the CLI.
+ */
+public func researchExport(dbPath: String, startUnix: Double, endUnix: Double, streams: [String], tzOffsetHours: Double, outDir: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_oura_core_fn_func_research_export(
+        FfiConverterString.lower(dbPath),
+        FfiConverterDouble.lower(startUnix),
+        FfiConverterDouble.lower(endUnix),
+        FfiConverterSequenceString.lower(streams),
+        FfiConverterDouble.lower(tzOffsetHours),
+        FfiConverterString.lower(outDir),$0
+    )
+})
+}
+/**
  * HRV RMSSD (ms) over inter-beat intervals — the shared `oura-analysis` algorithm,
  * reachable natively. Returns -1 when the input is too short.
  */
@@ -1580,6 +1633,9 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_oura_core_checksum_func_add_research_marker() != 62335) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_oura_core_checksum_func_backup_database() != 40677) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1599,6 +1655,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_quick_summary_json() != 3685) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_func_research_export() != 56017) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_rmssd() != 51404) {

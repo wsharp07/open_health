@@ -1075,11 +1075,31 @@ function sleepSection(d, ymd, axis, cursor) {
   }
   if (staged && n.staging_complete === false)
     sec.append(el("p", "error", "Incomplete sleep analysis. Gaps mean no data, not awake time; sleep metrics are withheld."));
+  if (staged && n.staging_source === "signals") {
+    const note = el("p", "hr-note",
+      "Hypnogram from the local signal estimate (heart rate, HRV and motion), not Oura's sleep-staging model. " +
+      "To use Oura's validated model instead, install Python + torch and place the model files under notes/models/ " +
+      "(or set OURA_MODELS_DIR); see dashboard/README.md.");
+    sec.append(note);
+  }
   if (staged) sec.append(stageLegend());
   else sec.append(el("p", "hr-note", "Sleep stages are unavailable for this night. The lanes below are what the ring recorded overnight."));
 
   const W = 1000, a = axis.frac(n.start_unix), b = axis.frac(n.end_unix);
   const rows = [];
+  if (staged && n.stages_5min && n.stages_5min.length) {
+    // What the official Oura app draws: the same stages in 5-minute blocks, laid
+    // from the first NSSA epoch (floor of bedtime start to the 30 s grid).
+    const st5 = n.stages_5min, t0 = n.stages_t0_unix || n.start_unix;
+    const a5 = axis.frac(t0), b5 = axis.frac(t0 + st5.length * 300);
+    rows.push({
+      label: "Stages · 5 min (Oura app)", summary: "", height: 96, html: hypnoSvg(st5, W, 92, [a5, b5]),
+      valueAt: (t) => {
+        const f = axis.frac(t);
+        return f < a5 || f >= b5 ? "—" : (STAGE[st5[Math.floor(((f - a5) / Math.max(1e-9, b5 - a5)) * st5.length)]] || {}).name || "";
+      },
+    });
+  }
   if (staged) {
     const st = n.stages_full;
     rows.push({
@@ -1541,6 +1561,20 @@ const hhmmOf = (unix) => {
   return `${s.slice(5, 10).replace("-", "/")} ${s.slice(11, 16)}`;
 };
 
+// "Recorded <date> <hm> (Xd/Xh/<1h ago)" for a battery reading, or "" if unknown.
+// Shared by the device card and the toolbar battery pill so the two cannot drift.
+function batteryRecordedLabel(dev) {
+  if (!dev.battery_recorded) return "";
+  let rec = `Recorded ${dev.battery_recorded}${dev.battery_recorded_hm ? " " + dev.battery_recorded_hm : ""}`;
+  const h = dev.battery_fresh_hours;
+  if (h != null) {
+    if (h >= 24) rec += ` (${Math.round(h / 24)}d ago)`;
+    else if (h >= 1) rec += ` (${Math.round(h)}h ago)`;
+    else rec += ` (<1h ago)`;
+  }
+  return rec;
+}
+
 function renderDevice(d) {
   const box = $("device");
   const dev = d.device || {};
@@ -1551,6 +1585,9 @@ function renderDevice(d) {
   const bpct = dev.battery_pct;
   const bstat = stat("Battery", bpct != null ? bpct : "—", "%");
   if (bpct != null && bpct < 20) bstat.classList.add("low");
+  if (dev.battery_recorded) {
+    bstat.title = `Battery: ${bpct != null ? bpct + "%" : "—"}${dev.battery_v ? " (" + dev.battery_v + " V)" : ""}\n${batteryRecordedLabel(dev)}`;
+  }
   stats.append(bstat);
   const fresh = dev.fresh_hours != null ? (dev.fresh_hours < 1 ? "<1" : Math.round(dev.fresh_hours)) : "—";
   stats.append(stat("Last sync", fresh, " h ago"));
@@ -1621,7 +1658,7 @@ function renderDevice(d) {
     kvItem("API", esc(dev.api_version || "—")) +
     kvItem("MAC", esc(dev.mac || "—")) +
     kvItem("Hardware", esc(dev.hardware_id || "—")) +
-    kvItem("Battery", dev.battery_v != null ? dev.battery_v + " V" : "—") +
+    kvItem("Battery", dev.battery_v != null ? `${dev.battery_pct != null ? dev.battery_pct + "%" : "—"} · ${dev.battery_v} V` + (dev.battery_recorded ? `<br><span style="color:var(--faint);font-size:11px">Recorded ${dev.battery_recorded}${dev.battery_recorded_hm ? " " + dev.battery_recorded_hm : ""}</span>` : "") : (dev.battery_pct != null ? `${dev.battery_pct}%` : "—")) +
     kvItem("Last sync", `${esc(dev.synced || "—")} ${esc(dev.synced_hm || "")}`) +
     kvItem("Sync cursor", dev.next_cursor != null ? dev.next_cursor.toLocaleString() : "—") +
     kvItem("History", historyDetail) +
@@ -1973,7 +2010,11 @@ function renderActions(d) {
     b.innerHTML = icon("battery-high") + `<span>${dev.battery_pct}%</span>`;
     b.classList.toggle("low", dev.battery_pct < 20);
     b.hidden = false;
-    b.title = `Ring battery ${dev.battery_pct}%${dev.battery_v ? " · " + dev.battery_v + " V" : ""}`;
+    let title = `Ring battery ${dev.battery_pct}%`;
+    if (dev.battery_v) title += ` · ${dev.battery_v} V`;
+    const rec = batteryRecordedLabel(dev);
+    if (rec) title += `\n${rec}`;
+    b.title = title;
   } else {
     b.hidden = true;
   }
@@ -2198,3 +2239,47 @@ $("profile-btn").addEventListener("click", openProfile);
 $("profile-form").addEventListener("submit", saveProfile);
 $("profile-cancel").addEventListener("click", () => $("profile-dialog").close());
 load();
+
+// ── research export: raw CSVs for a window, built by oura-summary::research_export ──
+(function researchExport() {
+  const form = document.getElementById("research-form");
+  if (!form) return;
+  const pad = (n) => String(n).padStart(2, "0");
+  const local = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const start = new Date(); start.setDate(start.getDate() - 1); start.setHours(20, 0, 0, 0);
+  const end = new Date(); end.setHours(12, 0, 0, 0);
+  form.querySelector("#rx-start").value = local(start);
+  form.querySelector("#rx-end").value = local(end);
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const status = form.querySelector("#rx-status");
+    const s = new Date(form.querySelector("#rx-start").value);
+    const t = new Date(form.querySelector("#rx-end").value);
+    const streams = [...form.querySelectorAll("#rx-streams input:checked")].map((i) => i.value);
+    if (!(t > s)) { status.textContent = "The end must be after the start."; return; }
+    if (!streams.length) { status.textContent = "Choose at least one kind of data."; return; }
+    const q = new URLSearchParams({
+      start: String(s.getTime() / 1000), end: String(t.getTime() / 1000),
+      streams: streams.join(","), tz: String(-s.getTimezoneOffset() / 60),
+    });
+    const a = document.createElement("a");
+    a.href = `/api/research-export?${q}`;
+    document.body.append(a); a.click(); a.remove();
+    status.textContent = "Preparing the ZIP. Your browser will save it when it is ready.";
+  });
+  form.querySelector("#rx-mark").addEventListener("click", async () => {
+    const status = form.querySelector("#rx-status");
+    const label = form.querySelector("#rx-label").value;
+    try {
+      const r = await fetch("/api/research-marker", {
+        method: "POST", headers: { "Content-Type": "application/json", "X-Oura-Dash": "1" },
+        body: JSON.stringify({ label }),
+      });
+      const j = await r.json();
+      if (j.error) throw new Error(j.error);
+      status.textContent = `Marked at ${new Date(j.unix * 1000).toLocaleTimeString()}. It will be in markers.csv.`;
+    } catch (err) {
+      status.textContent = `Could not save the marker: ${err.message}`;
+    }
+  });
+})();

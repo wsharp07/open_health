@@ -31,6 +31,8 @@ xcrun -sdk iphonesimulator clang++ -std=c++17 -fobjc-arc -O1 -target "$TRIPLE" \
     -c "$APPDIR/TorchBridge.mm" -o "$BUILD/TorchBridge.o"
 xcrun -sdk iphonesimulator clang -std=c11 -O1 -target "$TRIPLE" \
     -c "$APPDIR/CrashCatch.c" -o "$BUILD/CrashCatch.o"
+xcrun -sdk iphonesimulator clang -std=c11 -O2 -ffp-contract=off -target "$TRIPLE" \
+    -c "$APPDIR/NssaOps.c" -o "$BUILD/NssaOps.o"
 
 echo "==> compile SwiftUI app (TORCH) + UniFFI bindings, link core + torch"
 # -O so simulator stage timings resemble the Release build that ships.
@@ -42,9 +44,9 @@ xcrun -sdk iphonesimulator swiftc -O \
     "$APPDIR/Models.swift" "$APPDIR/Core.swift" "$APPDIR/Components.swift" "$APPDIR/Reports.swift" \
     "$APPDIR/BLETransport.swift" "$APPDIR/RingSync.swift" "$APPDIR/ProfileSettings.swift" \
     "$APPDIR/EventStore.swift" "$APPDIR/ModelCache.swift" "$APPDIR/ModelProgress.swift" \
-    "$APPDIR/SleepStaging.swift" "$APPDIR/CvaModel.swift" "$APPDIR/ActivityModel.swift" "$APPDIR/IllnessModel.swift" \
+    "$APPDIR/SleepStaging.swift" "$APPDIR/IbiCorrection.swift" "$APPDIR/CvaModel.swift" "$APPDIR/ActivityModel.swift" "$APPDIR/IllnessModel.swift" \
     "$APPDIR/Diagnostics.swift" "$APPDIR/HealthExport.swift" "$APPDIR/DayExport.swift" "$APPDIR/WorkCoordinator.swift" \
-    "$APPDIR/HeartRate.swift" "$APPDIR/RawData.swift" "$BUILD/TorchBridge.o" "$BUILD/CrashCatch.o" \
+    "$APPDIR/HeartRate.swift" "$APPDIR/RawData.swift" "$APPDIR/ResearchExport.swift" "$BUILD/TorchBridge.o" "$BUILD/CrashCatch.o" "$BUILD/NssaOps.o" \
     -L "$XCF" -loura_core \
     -lc++ -lsqlite3 \
     -L "$LT/lib" -ltorch -ltorch_cpu -lc10 \
@@ -59,7 +61,8 @@ echo "==> bundle torch dylibs + model + data"
 mkdir -p "$APP/Frameworks"
 cp "$LT/lib/libtorch.dylib" "$LT/lib/libtorch_cpu.dylib" \
    "$LT/lib/libc10.dylib" "$LT/lib/libtorch_global_deps.dylib" "$APP/Frameworks/"
-cp "$REPO/notes/models/mobile/sleepnet_moonstone_1_2_0.ptl" "$APP/sleepnet_moonstone_1_2_0.ptl"
+cp "$REPO/notes/models/mobile/sleepstaging_2_6_0.ptl" "$APP/sleepstaging_2_6_0.ptl"
+cp "$REPO/notes/models/mobile/sleepstaging_2_6_0_classifier.bin" "$APP/sleepstaging_2_6_0_classifier.bin"
 cp "$REPO/notes/models/mobile/cva_2_1_0.ptl" "$APP/cva_2_1_0.ptl"
 cp "$REPO/notes/models/mobile/automatic_activity_detection_3_1_11.ptl" "$APP/automatic_activity_detection_3_1_11.ptl"
 cp "$REPO/notes/models/mobile/steps_motion_decoder_2_0_0.ptl" "$APP/steps_motion_decoder_2_0_0.ptl"

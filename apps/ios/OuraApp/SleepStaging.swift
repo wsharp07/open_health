@@ -1,278 +1,311 @@
-#if TORCH
 import Foundation
-// sqlite3 comes from the bridging header (TorchBridge.h includes <sqlite3.h>)
 
-// On-device sleep staging: read the synced DB, assemble the raw SleepNet inputs
-// (a faithful port of tools/run_sleep_model.py — the model bakes in its own
-// preprocessing), and run sleepnet_moonstone via the LibTorch lite bridge. Returns
-// date-label → per-30s stage codes, matching the web dashboard's `nights[].stages`.
-enum SleepStaging {
-    /// Everything SleepNet receives for one night — also the exact material the
-    /// incremental cache fingerprints.
-    struct NightInputs {
-        let startDs: Int64, endDs: Int64
-        let startMs: Int64, endMs: Int64
-        let beats: [(Int64, Float, Float, Float)]
-        let acm: [(Int64, Float)]
-        let temp: [(Int64, Float)]
+// Pure NSSA input builders — line-by-line twins of tools/nssa_inputs.py and the grid
+// mapping of tools/run_sleep_model.py. Not TORCH-gated so the unit tests run them
+// against Tests/NssaParityFixture.json in every build.
+enum NssaInputs {
+    static let tagBedtime = 0x76, tagAcm = 0x72, tagIbi = 0x60, tagTemp = 0x75
+    static let tempSampleMs: Int64 = 30_000
+    static let epochMs: Int64 = 30_000
+
+    /// `parse_api_sleep_acm_period`: finger angles (tmean, max, iqr) = int + frac/255,
+    /// MAD (tmean, max, iqr) = 12-bit/4095 + high nibble, all Float. Returned in the
+    /// model's order [madIqr, madMax, madTmean, faIqr, faMax, faMean].
+    static func decodeAcmPeriod(_ body: [UInt8]?) -> [Float]? {
+        guard let b = body, b.count == 12 else { return nil }
+        var angle: [Float] = []
+        for i in 0..<3 { angle.append(Float(b[2 * i]) / Float(255.0) + Float(b[2 * i + 1])) }
+        var mad: [Float] = []
+        for i in 0..<3 {
+            let lo = Int(b[6 + 2 * i]), hi = Int(b[7 + 2 * i])
+            mad.append(Float(lo | ((hi & 0x0F) << 8)) / Float(4095.0) + Float(hi >> 4))
+        }
+        return [mad[2], mad[1], mad[0], angle[2], angle[1], angle[0]]
     }
 
-    /// Load already-cached sleep stage arrays keyed by `NightRow.stagingKey`.
-    static func cachedStages(nights: [NightRow]) -> [String: [Int]] {
-        let globalKey = ModelCacheStore.globalKey(profile: nil, timezone: false)
-        let cache: [String: StagedNightEntry] = ModelCacheStore.load(ModelCacheStore.stagingFile,
-                                                                     globalKey: globalKey)
-        var out: [String: [Int]] = [:]
-        for night in nights where night.start_ds != nil {
-            let key = night.stagingKey
-            if let entry = cache[key], !entry.stages.isEmpty {
-                out[key] = entry.stages
+    /// `parse_api_sleep_temp_event`: LE centi-degrees, sample i of n at event-(n-1-i)*30 s.
+    static func expandTempEvent(_ body: [UInt8]?, _ eventMs: Int64) -> [(Int64, Float)] {
+        guard let b = body, b.count >= 2, b.count <= 15, b.count % 2 == 0 else { return [] }
+        let n = b.count / 2
+        return (0..<n).map { i in
+            let raw = Int(b[2 * i]) | (Int(b[2 * i + 1]) << 8)
+            return (eventMs - Int64(n - 1 - i) * tempSampleMs, Float(raw) / Float(100.0))
+        }
+    }
+
+    /// `parse_api_ibi_and_amplitude_event`: beat k starts at event - ibi[k...5],
+    /// clamped to the previous stamp. Returns (beats, newLast).
+    static func expandIbiEvent(_ ibis: [Int], _ amps: [Int], _ eventMs: Int64, _ last0: Int64)
+        -> ([(Int64, Int, Int)], Int64) {
+        var last = last0
+        var beats: [(Int64, Int, Int)] = []
+        var stamp = eventMs - Int64(ibis.reduce(0, +))
+        for (i, ibi) in ibis.enumerated() {
+            let clamped = stamp > last ? stamp : last
+            beats.append((clamped, ibi, i < amps.count ? amps[i] : 0))
+            last = clamped
+            stamp += Int64(ibi)
+        }
+        return (beats, last)
+    }
+
+    /// indexOfFirstAndLastOrNull + subListInclusive over item timestamps.
+    static func inclusiveWindow<T>(_ items: [T], _ start: Int64, _ end: Int64, ts: (T) -> Int64) -> [T] {
+        guard let first = items.firstIndex(where: { start <= ts($0) && ts($0) <= end }),
+              let last = items.lastIndex(where: { start <= ts($0) && ts($0) <= end }) else { return [] }
+        return Array(items[first...last])
+    }
+
+    struct Row { let ds: Int64; let tag: Int; let json: [String: Any]; let cu: Int64; let body: [UInt8]? }
+
+    struct Inputs {
+        var bedtime: (Int64, Int64)
+        var acm: [(Int64, [Float])]
+        var ibi: [(Int64, Int, Int, Int)]
+        var temp: [(Int64, Float)]
+    }
+
+    /// Stable sort by timestamp (Python's sort is stable).
+    private static func stableSorted<T>(_ a: [T], _ key: (T) -> Int64) -> [T] {
+        a.enumerated().sorted { (key($0.element), $0.offset) < (key($1.element), $1.offset) }.map(\.element)
+    }
+
+    /// Twin of nssa_inputs.collect_nssa_inputs.
+    static func collect(rows: [Row], startDs: Int64, endDs: Int64, capturedUnix: Int64,
+                        unixMs: (Int64, Int64) -> Int64,
+                        correct: ([(Int64, Int, Int)]) -> [(Int64, Int, Int, Int)] = IbiCorrection.correct) -> Inputs {
+        let startMs = unixMs(startDs, capturedUnix), endMs = unixMs(endDs, capturedUnix)
+        var acmEvents: [(Int64, [Float])] = [], tempEvents: [(Int64, [UInt8]?)] = []
+        var ibiEvents: [(Int64, [Int], [Int])] = []
+        for r in rows where r.tag == tagAcm || r.tag == tagIbi || r.tag == tagTemp {
+            guard startDs - 6000 <= r.ds, r.ds <= endDs + 6000 else { continue }
+            let eventMs = unixMs(r.ds, r.cu)
+            if abs(eventMs - (startMs + (r.ds - startDs) * 100)) > 300_000 { continue }
+            guard startMs <= eventMs, eventMs <= endMs else { continue }
+            if r.tag == tagAcm {
+                if let s = decodeAcmPeriod(r.body) { acmEvents.append((eventMs, s)) }
+            } else if r.tag == tagTemp {
+                tempEvents.append((eventMs, r.body))
+            } else {
+                let ibis = (r.json["ibi_ms"] as? [NSNumber])?.map(\.intValue) ?? []
+                if ibis.count == 6 {
+                    ibiEvents.append((eventMs, ibis, (r.json["amplitude"] as? [NSNumber])?.map(\.intValue) ?? []))
+                }
+            }
+        }
+        acmEvents = stableSorted(acmEvents) { $0.0 }
+        tempEvents = stableSorted(tempEvents) { $0.0 }
+        ibiEvents = stableSorted(ibiEvents) { $0.0 }
+        let acm = inclusiveWindow(acmEvents, startMs, endMs) { $0.0 }
+        var temp: [(Int64, Float)] = []
+        for (t, b) in tempEvents { temp += expandTempEvent(b, t) }
+        temp = inclusiveWindow(temp, startMs, endMs) { $0.0 }
+        var beats: [(Int64, Int, Int)] = [], last: Int64 = 0
+        for (t, ibis, amps) in ibiEvents {
+            let (ex, l) = expandIbiEvent(ibis, amps, t, last)
+            beats += ex; last = l
+        }
+        beats = inclusiveWindow(beats, startMs, endMs) { $0.0 }
+        return Inputs(bedtime: (startMs, endMs), acm: acm, ibi: beats.isEmpty ? [] : correct(beats), temp: temp)
+    }
+
+    /// Twin of run_sleep_model.grid_stages: midpoint rule on the night's 30 s grid,
+    /// cells outside every ring bedtime = 4, cells of a failed bedtime = 0.
+    static func gridStages(periods: [(ts: [Int64], codes: [Int])], failed: [(Int64, Int64)],
+                           startMs: Int64, endMs: Int64) -> [Int] {
+        let n = max(1, Int((endMs - startMs + epochMs - 1) / epochMs))
+        var out = Array(repeating: 4, count: n)
+        for (bs, be) in failed {
+            for idx in 0..<n {
+                let mid = startMs + Int64(idx) * epochMs + epochMs / 2
+                if bs <= mid && mid < be { out[idx] = 0 }
+            }
+        }
+        for p in periods {
+            for (t, code) in zip(p.ts, p.codes) {
+                let num = t - startMs - epochMs / 2
+                // ceil division matching Python's -(-a // b) for negative a too
+                let q = num >= 0 ? (num + epochMs - 1) / epochMs : -((-num) / epochMs)
+                let idx = Int(q)
+                if idx >= 0 && idx < n && (1...4).contains(code) { out[idx] = code }
             }
         }
         return out
     }
 
-    // Returns date-key → stage codes, plus a non-nil `error` only for genuine failures
-    // (bundled model missing). An empty map with `error == nil` just means no sleep data.
+    /// NssaPyTorchModel demographics [age, bmi, sex] (nssa_stager.demographics).
+    static func demographics(age: Double, heightM: Double, weightKg: Double, sex: String) -> [Float] {
+        let bmi = weightKg / (heightM * heightM)
+        let s: Float = sex.uppercased().hasPrefix("F") ? -1 : (sex.uppercased().hasPrefix("M") ? 1 : 0)
+        return [Float(Int(age)), Float(bmi), s]
+    }
+}
+
+#if TORCH
+// sqlite3 comes from the bridging header (TorchBridge.h includes <sqlite3.h>)
+
+// On-device sleep staging with Oura's NSSA model (sleepstaging_2_6_0), exactly as
+// the official app stages each ring bedtime — a twin of tools/run_sleep_model.py.
+enum SleepStaging {
+    static let modelId = "nssa-2.6.0-r1"
+
+    struct Staged { let stages: [Int]; let source: String; let t0Unix: Double? }
+
+    /// Load already-cached sleep stage arrays keyed by `NightRow.stagingKey`.
+    static func cachedStages(nights: [NightRow], profile: Profile?,
+                             cacheFile: String = ModelCacheStore.stagingFile) -> [String: [Int]] {
+        cachedEntries(nights: nights, profile: profile, cacheFile: cacheFile).mapValues(\.stages)
+    }
+
+    /// The cheap cache path must use the same demographics as `run`. Otherwise a
+    /// profile edit can keep old nights without reaching their input fingerprint
+    /// check. Ring size and display timezone are not NSSA inputs.
+    static func cacheKey(profile: Profile?) -> String {
+        var fp = FNV64()
+        for byte in modelId.utf8 { fp.combine(Int(byte)) }
+        for scalar in demographics(profile) { fp.combine(scalar) }
+        return ModelCacheStore.globalKey(profile: nil, timezone: false) + "|" + fp.hex
+    }
+
+    static func windowKey(_ night: NightRow) -> String {
+        "\(night.stagingKey)|\(night.end_ds.map(String.init) ?? "nil")"
+            + "|\(night.end_unix.map(String.init) ?? "nil")|\(night.durationS.bitPattern)"
+    }
+
+    static func cachedEntries(nights: [NightRow], profile: Profile?,
+                              cacheFile: String = ModelCacheStore.stagingFile) -> [String: StagedNightEntry] {
+        let globalKey = cacheKey(profile: profile)
+        let cache: [String: StagedNightEntry] = ModelCacheStore.load(cacheFile,
+                                                                     globalKey: globalKey)
+        var out: [String: StagedNightEntry] = [:]
+        for night in nights where night.start_ds != nil {
+            if let entry = cache[night.stagingKey], entry.windowKey == windowKey(night),
+               !entry.stages.isEmpty { out[night.stagingKey] = entry }
+        }
+        return out
+    }
+
+    /// Same defaults as oura-summary Demographics / run_sleep_model.read_profile.
+    static func demographics(_ p: Profile?) -> [Float] {
+        NssaInputs.demographics(age: p?.age ?? 30, heightM: p?.height_m ?? 1.78,
+                                weightKg: p?.weight_kg ?? 75, sex: p?.sex ?? "M")
+    }
+
     static func run(nights: [NightRow], events: EventStore.Events, clock: EventStore.RingClock,
-                    force: Bool = false, pruneCache: Bool = true,
+                    profile: Profile? = nil, force: Bool = false, pruneCache: Bool = true,
                     progress: @escaping @Sendable (String) -> Void = { _ in }) -> (staged: [String: [Int]], error: String?) {
-        guard let modelPath = Bundle.main.path(forResource: "sleepnet_moonstone_1_2_0", ofType: "ptl")
+        guard let modelPath = Bundle.main.path(forResource: "sleepstaging_2_6_0", ofType: "ptl"),
+              let classifierPath = Bundle.main.path(forResource: "sleepstaging_2_6_0_classifier", ofType: "bin")
         else { return ([:], "sleep model file missing from the app bundle") }
         guard !events.isEmpty else { return ([:], nil) }
+        oura_nssa_set_classifier_path(classifierPath)
+        let demo = demographics(profile)
 
-        // The shared Rust summary canonicalizes brief wake splits and premature
-        // bedtime ends. Consume those exact windows so the model cannot reintroduce
-        // the raw ring boundary that the UI already corrected.
-        // `nights` arrive newest-first from the summary; keep that order so the
-        // night the user is looking at stages first.
-        let beds = nights.compactMap { night -> (night: NightRow, start: Int64, end: Int64, cu: Int64, key: String)? in
-            guard let start = night.start_ds, let end = night.end_ds else { return nil }
-            let captured = night.captured_unix ?? events.restricted("tag IN (118,78)").first { event in
-                (event.tag == 0x76 && (event.json["bedtime_start_ds"] as? NSNumber)?.int64Value == start)
-                    || (event.tag == 0x4e && (event.json["bedtime_start"] as? NSNumber)?.int64Value == start)
-            }?.cu
-            return (night, start, end, captured ?? events.last?.cu ?? 0, night.stagingKey)
+        func ms(_ ds: Int64, _ cu: Int64) -> Int64 {
+            Int64((clock.unixSeconds(ds, capturedUnix: cu) * 1000).rounded(.toNearestOrEven))
+        }
+        // One read of the rows NSSA needs (bedtimes + its three streams).
+        var rows: [NssaInputs.Row] = []
+        var bedtimes: [NssaInputs.Row] = []
+        for e in events.restricted("tag IN (96,114,117,118)") {
+            let r = NssaInputs.Row(ds: e.ds, tag: e.tag, json: e.json, cu: e.cu, body: e.body.map { [UInt8]($0) })
+            if e.tag == NssaInputs.tagBedtime { bedtimes.append(r) } else { rows.append(r) }
+        }
+        guard events.error == nil else { return ([:], "event read failed") }
+
+        /// run_sleep_model.ring_bedtimes: latest 0x76 per start in the same boot.
+        func ringBedtimes(_ startDs: Int64, _ endDs: Int64, _ captured: Int64) -> [(Int64, Int64, Int64)] {
+            var latest: [Int64: (Int64, Int64, Int64)] = [:]
+            for r in bedtimes {
+                guard let s = (r.json["bedtime_start_ds"] as? NSNumber)?.int64Value,
+                      let e = (r.json["bedtime_end_ds"] as? NSNumber)?.int64Value, e > s else { continue }
+                if abs(ms(s, r.cu) - ms(s, captured)) > 300_000 { continue }
+                if s < endDs && e > startDs { latest[s] = (s, e, r.cu) }
+            }
+            return latest.values.sorted { $0.0 < $1.0 }
         }
 
-        // A night's fingerprint covers its exact model inputs; a hit is by
-        // construction the hypnogram the model would have produced.
-        func fingerprint(_ inputs: NightInputs) -> String {
-            var h = FNV64()
-            h.combine(inputs.startDs); h.combine(inputs.endDs)
-            h.combine(inputs.startMs); h.combine(inputs.endMs)  // RingClock re-dating backstop
-            h.combine(inputs.beats.count)
-            for b in inputs.beats { h.combine(b.0); h.combine(b.1); h.combine(b.2); h.combine(b.3) }
-            h.combine(inputs.acm.count)
-            for a in inputs.acm { h.combine(a.0); h.combine(a.1) }
-            h.combine(inputs.temp.count)
-            for t in inputs.temp { h.combine(t.0); h.combine(t.1) }
-            return h.hex
-        }
-        let globalKey = ModelCacheStore.globalKey(profile: nil, timezone: false)
-        var cache: [String: StagedNightEntry] = ModelCacheStore.load(ModelCacheStore.stagingFile,
-                                                                     globalKey: globalKey)
-
-        // Key by bedtime start and absolute epoch, since ds resets after a reboot.
+        let globalKey = cacheKey(profile: profile)
+        var cache: [String: StagedNightEntry] = ModelCacheStore.load(ModelCacheStore.stagingFile, globalKey: globalKey)
         var result: [String: [Int]] = [:]
         var currentKeys = Set<String>()
-        var recomputed = 0
-        // Count only the nights that actually need the model, so the progress pill
-        // reads "night 1 of 1" on a normal launch instead of the whole history.
-        var pending: [(night: NightRow, key: String, fp: String, inputs: NightInputs?)] = []
-        for bed in beds {
+        var failures = 0
+        for (index, night) in nights.enumerated() {
+            guard let startDs = night.start_ds, let endDs = night.end_ds else { continue }
             guard !AnalysisRun.cancelled, events.error == nil else { return ([:], "analysis interrupted") }
-            let inputs = nightInputs(start: bed.start, end: bed.end, cu: bed.cu,
-                                     events: events, clock: clock)
-            guard events.error == nil else { return ([:], "event read failed") }
-            let key = bed.key
-            if let inputs {
-                let fp = fingerprint(inputs)
-                currentKeys.insert(key)
-                if !force, let entry = cache[key], entry.fp == fp {
-                    if !entry.stages.isEmpty { result[key] = entry.stages }
-                } else {
-                    pending.append((bed.night, key, fp, inputs))
-                }
-            } else if bed.night.hasSignals {
-                let fp = "signals:\(bed.start):\(bed.end):\(bed.cu)"
-                currentKeys.insert(key)
-                if !force, let entry = cache[key], entry.fp == fp, !entry.stages.isEmpty {
-                    result[key] = entry.stages
-                } else {
-                    pending.append((bed.night, key, fp, nil))
-                }
+            progress(nights.count > 1 ? "Analyzing sleep \(index + 1)/\(nights.count)" : "Analyzing sleep")
+            let cu = night.captured_unix ?? events.last?.cu ?? 0
+            let key = night.stagingKey
+            currentKeys.insert(key)
+            if clock.datedUnixSeconds(startDs, capturedUnix: cu) == nil
+                || clock.datedUnixSeconds(endDs, capturedUnix: cu) == nil { continue }
+            var beds = ringBedtimes(startDs, endDs, cu)
+            if beds.isEmpty { beds = [(startDs, endDs, cu)] }
+            var periods: [(ts: [Int64], codes: [Int])] = [], failed: [(Int64, Int64)] = []
+            var fp = FNV64()
+            for b in modelId.utf8 { fp.combine(Int(b)) }; for d in demo { fp.combine(d) }
+            fp.combine(startDs); fp.combine(endDs)
+            var inputsList: [NssaInputs.Inputs] = []
+            for (bs, be, _) in beds {
+                let inp = NssaInputs.collect(rows: rows, startDs: bs, endDs: be, capturedUnix: cu, unixMs: ms)
+                fp.combine(inp.bedtime.0); fp.combine(inp.bedtime.1)
+                fp.combine(inp.acm.count); for a in inp.acm { fp.combine(a.0); for v in a.1 { fp.combine(v) } }
+                fp.combine(inp.ibi.count); for b in inp.ibi { fp.combine(b.0); fp.combine(b.1); fp.combine(b.2); fp.combine(b.3) }
+                fp.combine(inp.temp.count); for t in inp.temp { fp.combine(t.0); fp.combine(t.1) }
+                inputsList.append(inp)
             }
-        }
-        var inferenceFailures = 0
-        for (index, item) in pending.enumerated() {
-            let key = item.key, fp = item.fp
-            progress(pending.count > 1 ? "Analyzing sleep \(index + 1)/\(pending.count)" : "Analyzing sleep")
-            guard !AnalysisRun.cancelled else { return ([:], "analysis paused") }
-            let stages: [Int]? = {
-                if let inputs = item.inputs, let s = stageNight(inputs, modelPath: modelPath), !s.isEmpty {
-                    return s
-                }
-                return Sleep.estimateStages(night: item.night)
-            }()
-            guard let stages, !stages.isEmpty else {
-                inferenceFailures += 1
+            let fpHex = fp.hex
+            if !force, let entry = cache[key], entry.fp == fpHex,
+               entry.windowKey == windowKey(night), !entry.stages.isEmpty {
+                result[key] = entry.stages
                 continue
             }
+            for inp in inputsList {
+                if let staged = stage(inp, demo: demo, modelPath: modelPath) { periods.append(staged) }
+                else { failed.append(inp.bedtime) }
+            }
+            var stages: [Int]? = nil, source = "nssa", t0: Double? = nil
+            if !periods.isEmpty {
+                stages = NssaInputs.gridStages(periods: periods, failed: failed,
+                                               startMs: ms(startDs, cu), endMs: ms(endDs, cu))
+                var main = periods[0]
+                for p in periods.dropFirst() where p.codes.count > main.codes.count { main = p }
+                t0 = main.ts.first.map { Double($0) / 1000 }
+            } else if night.hasSignals, let est = Sleep.estimateStages(night: night) {
+                stages = est; source = "signals"
+            }
+            guard let stages, !stages.isEmpty else { failures += 1; continue }
             result[key] = stages
-            cache[key] = StagedNightEntry(fp: fp, stages: stages)
+            cache[key] = StagedNightEntry(fp: fpHex, stages: stages, windowKey: windowKey(night),
+                                           source: source, t0Unix: t0)
             ModelCacheStore.save(ModelCacheStore.stagingFile, globalKey: globalKey, entries: cache)
-            recomputed += 1
         }
         guard events.error == nil, !AnalysisRun.cancelled else { return ([:], "analysis interrupted") }
-        dlog("models", "sleep recomputed=\(recomputed) total=\(currentKeys.count) failures=\(inferenceFailures)")
-        let pruned = cache.filter { currentKeys.contains($0.key) }
-        if pruneCache && pruned.count != cache.count {
-            ModelCacheStore.save(ModelCacheStore.stagingFile, globalKey: globalKey, entries: pruned)
+        if pruneCache {
+            let pruned = cache.filter { currentKeys.contains($0.key) }
+            if pruned.count != cache.count { ModelCacheStore.save(ModelCacheStore.stagingFile, globalKey: globalKey, entries: pruned) }
         }
-        if result.isEmpty && inferenceFailures > 0 && !pending.isEmpty {
-            return (result, "sleep inference failed")
-        }
+        if result.isEmpty && failures > 0 { return (result, "sleep inference failed") }
         return (result, nil)
     }
 
-    /// Gather one night's raw model inputs; nil when there's no usable beat data.
-    static func nightInputs(start startDs: Int64, end endDs: Int64, cu bedCu: Int64,
-                            events: EventStore.Events, clock: EventStore.RingClock) -> NightInputs? {
-        // ms(ds) → absolute epoch ms, epoch-aware (ds resets on ring reboot; see EventStore)
-        func ms(_ ds: Int64, _ cu: Int64) -> Int64 {
-            Int64(clock.unixSeconds(ds, capturedUnix: cu) * 1000)
-        }
-        let startMs = ms(startDs, bedCu), endMs = ms(endDs, bedCu)
-        let lo = startDs - 6000, hi = endDs + 6000
-        var beats60: [(Int64, Float, Float, Float)] = []
-        var beats80: [(Int64, Float, Float, Float)] = []
-        var hrvRows: [(Int64, [String: Any])] = []
-        var acm: [(Int64, Float)] = [], temp46: [(Int64, Float)] = [], temp75: [(Int64, Float)] = []
-        for e in events.restricted("ring_timestamp BETWEEN \(lo) AND \(hi) AND tag IN (96,128,93,71,70,117)") {
-            let timestamp = ms(e.ds, e.cu)
-            guard timestamp >= startMs - 600000, timestamp <= endMs + 600000,
-                  abs(timestamp - (startMs + (e.ds - startDs) * 100)) <= 300000 else { continue }
-            switch e.tag {
-            case 0x60:
-                guard let ibi = e.json["ibi_ms"] as? [NSNumber] else { continue }
-                let amp = (e.json["amplitude"] as? [NSNumber]) ?? []
-                let t = timestamp; var acc: Int64 = 0
-                for (i, xn) in ibi.enumerated() {
-                    let x = xn.int64Value
-                    if x <= 0 { continue }
-                    acc += x
-                    let ampVal: Float = i < amp.count ? amp[i].floatValue : 0
-                    let tailNoise = ibi.count >= 4 && i >= ibi.count - 2 && x < 600 && ampVal <= 0
-                    let valid: Float = (x >= 300 && x <= 2000 && !tailNoise) ? 1 : 0
-                    beats60.append((t + acc, Float(x), ampVal, valid))
-                }
-            case 0x80:
-                guard let ibi = e.json["ibi_ms"] as? [NSNumber] else { continue }
-                let amp = (e.json["amplitude"] as? [NSNumber]) ?? []
-                let quality = (e.json["quality"] as? [NSNumber]) ?? []
-                let t = timestamp; var acc: Int64 = 0
-                for (i, xn) in ibi.enumerated() {
-                    let x = xn.int64Value
-                    if x <= 0 { continue }
-                    acc += x
-                    let valid: Float = (x >= 300 && x <= 2000 && i < quality.count && quality[i].intValue == 1) ? 1 : 0
-                    let ampVal: Float = i < amp.count ? amp[i].floatValue : 0
-                    beats80.append((t + acc, Float(x), ampVal, valid))
-                }
-            case 0x5d:
-                hrvRows.append((timestamp, e.json))
-            case 0x47:
-                if let mo = (e.json["motion_seconds"] as? NSNumber)?.floatValue { acm.append((timestamp, mo)) }
-            case 0x75:
-                if let temps = e.json["temps_c"] as? [NSNumber] {
-                    let vals = temps.map(\.floatValue).filter { $0 > 0 }
-                    if !vals.isEmpty {
-                        temp75.append((timestamp, vals.reduce(0, +) / Float(vals.count)))
-                    }
-                }
-            case 0x46:
-                if let temps = e.json["temps_c"] as? [NSNumber], let c = temps.first?.floatValue { temp46.append((timestamp, c)) }
-            default: break
-            }
-        }
-        var beats: [(Int64, Float, Float, Float)] = []
-        if !beats60.isEmpty && !beats80.isEmpty {
-            beats60.sort { $0.0 < $1.0 }
-            let ts60 = beats60.map(\.0)
-            let posAmps = beats60.map(\.2).filter { $0 > 0 }.sorted()
-            let medAmp: Float = posAmps.isEmpty ? 1200.0 : posAmps[posAmps.count / 2]
-            beats = beats60
-            for b in beats80 {
-                var loIdx = 0, hiIdx = ts60.count
-                while loIdx < hiIdx {
-                    let mid = (loIdx + hiIdx) / 2
-                    if ts60[mid] < b.0 { loIdx = mid + 1 } else { hiIdx = mid }
-                }
-                var near = false
-                if loIdx < ts60.count && abs(ts60[loIdx] - b.0) <= 15_000 { near = true }
-                if loIdx > 0 && abs(ts60[loIdx - 1] - b.0) <= 15_000 { near = true }
-                if !near {
-                    beats.append((b.0, b.1, b.2 > 0 ? b.2 : medAmp, b.3))
-                }
-            }
-        } else if !beats60.isEmpty {
-            beats = beats60
-        } else {
-            beats = beats80.map { ($0.0, $0.1, $0.2 > 0 ? $0.2 : 1200.0, $0.3) }
-        }
-        if !beats.contains(where: { $0.3 == 1 }), !hrvRows.isEmpty {
-            var synth: [(Int64, Float, Float, Float)] = []
-            for (ts0, json) in hrvRows.sorted(by: { $0.0 < $1.0 }) {
-                let stepMs = max(1, (json["interval_min"] as? NSNumber)?.int64Value ?? 5) * 60_000
-                let hrs = (json["hr_bpm"] as? [NSNumber]) ?? []
-                let rmssds = (json["rmssd_ms"] as? [NSNumber]) ?? []
-                for (i, hrNum) in hrs.enumerated() {
-                    let hr = hrNum.floatValue
-                    guard hr > 0 else { continue }
-                    let meanIbi = min(max(60_000.0 / hr, 350.0), 1800.0)
-                    let rmssd = i < rmssds.count ? rmssds[i].floatValue : 30.0
-                    let jitter = min(max(rmssd * 0.5, 4.0), 60.0)
-                    let slotStart = ts0 + Int64(i) * stepMs
-                    var tCur = Float(slotStart)
-                    var k = 0
-                    while Int64(tCur) < slotStart + stepMs {
-                        let sign: Float = (k % 2 == 0) ? 1.0 : -1.0
-                        let ibi = min(max((meanIbi + sign * jitter * 0.5).rounded(), 330.0), 1950.0)
-                        tCur += ibi
-                        synth.append((Int64(tCur), ibi, 1200.0, 1.0))
-                        k += 1
-                    }
-                }
-            }
-            beats = synth
-        }
-        var temp = temp75.isEmpty ? temp46 : temp75
-        beats.sort { $0.0 < $1.0 }; acm.sort { $0.0 < $1.0 }; temp.sort { $0.0 < $1.0 }
-        guard !beats.isEmpty, beats.contains(where: { $0.3 == 1 }) else { return nil }
-        return NightInputs(startDs: startDs, endDs: endDs,
-                           startMs: startMs, endMs: endMs,
-                           beats: beats, acm: acm, temp: temp)
-    }
-
-    /// One SleepNet inference over one night's inputs.
-    private static func stageNight(_ inputs: NightInputs, modelPath: String) -> [Int]? {
-        var ibiTs = inputs.beats.map { $0.0 }
-        var ibiVal = inputs.beats.flatMap { [$0.1, $0.2, $0.3] }
-        var acmTs = inputs.acm.map { $0.0 }, acmVal = inputs.acm.map { $0.1 }
-        var tempTs = inputs.temp.map { $0.0 }, tempVal = inputs.temp.map { $0.1 }
-        var out = [Int32](repeating: 0, count: 8192)
-        var timestamps = [Int64](repeating: 0, count: 8192)
-        let n = oura_sleepnet(modelPath,
-                              &ibiTs, &ibiVal, Int32(inputs.beats.count),
-                              &acmTs, &acmVal, Int32(inputs.acm.count),
-                              &tempTs, &tempVal, Int32(inputs.temp.count),
-                              inputs.startMs, inputs.endMs, &out, &timestamps, 8192)
+    /// One NSSA forward over one ring bedtime; nil when the model's validator would
+    /// reject it (the official app then has no hypnogram either).
+    private static func stage(_ inp: NssaInputs.Inputs, demo: [Float], modelPath: String) -> (ts: [Int64], codes: [Int])? {
+        guard !inp.acm.isEmpty, !inp.ibi.isEmpty, !inp.temp.isEmpty else { return nil }
+        var acmTs = inp.acm.map(\.0), acmVal = inp.acm.flatMap(\.1)
+        var ibiTs = inp.ibi.map(\.0), ibiVal = inp.ibi.flatMap { [Float($0.1), Float($0.2), Float($0.3)] }
+        var tempTs = inp.temp.map(\.0), tempVal = inp.temp.map(\.1)
+        var demoV = demo
+        let cap = 8192
+        var out = [Int32](repeating: 0, count: cap)
+        var ts = [Int64](repeating: 0, count: cap)
+        let n = oura_nssa(modelPath, &acmTs, &acmVal, Int32(inp.acm.count),
+                          &ibiTs, &ibiVal, Int32(inp.ibi.count),
+                          &tempTs, &tempVal, Int32(inp.temp.count),
+                          &demoV, inp.bedtime.0, inp.bedtime.1, &out, &ts, Int32(cap))
         guard n > 0 else { return nil }
-        return Sleep.alignedStages(timestamps: Array(timestamps.prefix(Int(n))),
-                                   stages: out.prefix(Int(n)).map(Int.init),
-                                   startMs: inputs.startMs, endMs: inputs.endMs)
+        return (Array(ts.prefix(Int(n))), out.prefix(Int(n)).map(Int.init))
     }
 }
 #endif
-

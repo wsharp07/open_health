@@ -1006,3 +1006,10 @@ body.page-open { overflow: hidden; }
 .be-cancel { background: transparent; color: var(--faint); border: 1px solid transparent; }
 .be-reset:hover, .be-cancel:hover { color: var(--text); }
 
+
+/* research export form */
+.research { display: grid; gap: 8px; }
+.research input[type="datetime-local"], .research input[type="text"] { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 6px 8px; }
+.research fieldset { border: 1px solid var(--line); border-radius: var(--radius-sm); display: grid; gap: 4px; padding: 8px 10px; margin: 4px 0; }
+.research legend { color: var(--muted); padding: 0 4px; }
+.research .muted { color: var(--muted); margin: 0; }

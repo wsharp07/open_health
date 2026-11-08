@@ -73,15 +73,18 @@ enum Core {
     #if TORCH
     /// Launch and sync only fill the latest night's missing analysis. Historical
     /// results stay visible, and older missing nights are refreshed on demand.
-    static func automaticSleepPlan(nights: [NightRow], previous: Summary?, revalidateLatest: Bool = false) -> (saved: [String: [Int]], pending: [NightRow]) {
+    static func automaticSleepPlan(nights: [NightRow], previous: Summary?, revalidateLatest: Bool = false,
+                                   profile: Profile? = nil) -> (saved: [String: [Int]], pending: [NightRow]) {
+        let compatiblePrevious = SleepStaging.demographics(previous?.profile) == SleepStaging.demographics(profile)
+            ? previous : nil
         var saved: [String: [Int]] = [:]
         for night in nights {
             guard night.start_ds != nil else { continue }
-            if let old = previous?.nights.first(where: {
+            if let old = compatiblePrevious?.nights.first(where: {
                 $0.start_ds == night.start_ds && $0.end_ds == night.end_ds
                     && $0.ymd == night.ymd && $0.start == night.start && $0.end == night.end
                     && $0.start_unix == night.start_unix && $0.end_unix == night.end_unix
-            }), old.staging_source == "sleepnet", let stages = old.hypnogram, !stages.isEmpty {
+            }), old.staging_source == "nssa", let stages = old.hypnogram, !stages.isEmpty {
                 saved[night.stagingKey] = stages
             }
         }
@@ -118,7 +121,7 @@ enum Core {
                     return (previous, "No sleep data is saved for this day.")
                 }
                 let result = SleepStaging.run(nights: [night], events: events, clock: clock,
-                                             force: true, pruneCache: false, progress: progress)
+                                             profile: base.profile, force: true, pruneCache: false, progress: progress)
                 if let error = result.error { throw AnalysisRefreshFailure(error) }
                 guard let stages = result.staged[night.stagingKey], !stages.isEmpty else {
                     return (previous, "Not enough saved sleep data to refresh this night.")
@@ -197,8 +200,9 @@ enum Core {
         progress("Reading ring data")
         let storeDigest = EventStore.Events(path: DB.readPath()).digest()
         let sleepPlan = automaticSleepPlan(nights: base.nights, previous: validPrevious,
-                                           revalidateLatest: storeDigest == nil || validPrevious?.analysis_digest != storeDigest)
-        var staged = SleepStaging.cachedStages(nights: base.nights)
+                                           revalidateLatest: storeDigest == nil || validPrevious?.analysis_digest != storeDigest,
+                                           profile: profile)
+        var staged = SleepStaging.cachedStages(nights: base.nights, profile: profile)
         staged.merge(sleepPlan.saved) { _, fresh in fresh }
         var sleepPending = sleepPlan.pending
         for night in base.nights.prefix(7) {
@@ -239,7 +243,7 @@ enum Core {
                 let rSleep = sleepPending.isEmpty
                     ? (staged: [String: [Int]](), error: Optional<String>.none)
                     : SleepStaging.run(nights: sleepPending, events: events, clock: clock,
-                                       pruneCache: false, progress: progress)
+                                       profile: profile, pruneCache: false, progress: progress)
                 staged.merge(rSleep.staged) { _, fresh in fresh }
                 sleepErr = rSleep.error
                 dlog("models", "sleep automatic saved=\(staged.count) pending=\(sleepPending.count)")
@@ -289,14 +293,22 @@ enum Core {
     }
 
     private static func applySleepStages(_ staged: [String: [Int]], to s: inout Summary) {
+        // Source + first-epoch time of each staged night (NSSA, or the signal estimate).
+        let meta = SleepStaging.cachedEntries(nights: s.nights, profile: s.profile)
         for i in s.nights.indices {
             guard s.nights[i].start_ds != nil, var stages = staged[s.nights[i].stagingKey], !stages.isEmpty else { continue }
-            if !stages.contains(1) {
+            let entry = meta[s.nights[i].stagingKey]
+            let source = entry?.source ?? "nssa"
+            // Oura's own hypnograms are used verbatim (oura-summary is_oura_staging);
+            // only the signal estimate gets the deep-sleep recovery.
+            if !Sleep.isOuraStaging(source) && !stages.contains(1) {
                 stages = Sleep.refineDeepStages(stages: stages, night: s.nights[i])
             }
             s.nights[i].stages = stages
             s.nights[i].stages_full = stages
-            s.nights[i].staging_source = "sleepnet"
+            s.nights[i].staging_source = source
+            s.nights[i].stages_5min = Sleep.isOuraStaging(source) ? Sleep.aggregate5Min(stages) : nil
+            s.nights[i].stages_t0_unix = entry?.t0Unix
             s.nights[i].staging_complete = stages.allSatisfy { (1...4).contains($0) }
             s.nights[i].staging_coverage_pct = Double(stages.filter { (1...4).contains($0) }.count) / Double(stages.count) * 100
             let total = Double(stages.count)
@@ -305,7 +317,7 @@ enum Core {
             s.nights[i].rem_pct = pct(3); s.nights[i].wake_pct = pct(4)
             let asleep = total - Double(stages.filter { $0 == 4 }.count)
             s.nights[i].efficiency = s.nights[i].stagingComplete ? (asleep / total * 100).rounded() : nil
-            s.nights[i].autonomic = Sleep.autonomic(night: s.nights[i], stages: Sleep.smooth(stages, 5))
+            s.nights[i].autonomic = Sleep.autonomic(night: s.nights[i], stages: s.nights[i].analysisStages)
             s.nights[i].sleep_score = nil // The base score describes a different hypnogram.
         }
         // Staging can be partial while model inputs are still arriving. Never replace

@@ -179,6 +179,27 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Export the ring's raw streams (every heart beat, 30 s movement, SpO2 ratio,
+    /// skin temperature) for a time window as CSV files on the corrected clock —
+    /// the same files the iOS app and the web dashboard export. Offline.
+    ResearchExport {
+        /// Window start, local time `YYYY-MM-DDTHH:MM` (or unix seconds).
+        #[arg(long)]
+        start: String,
+        /// Window end, local time `YYYY-MM-DDTHH:MM` (or unix seconds).
+        #[arg(long)]
+        end: String,
+        /// Comma-separated streams (default: all): rr_intervals, rr_quality,
+        /// sleep_movement_30s, motion_30s, spo2_raw, skin_temperature.
+        #[arg(long)]
+        streams: Option<String>,
+        /// UTC offset (hours) for parsing --start/--end and the local_time column.
+        #[arg(long, default_value_t = local_tz_offset_hours(), value_parser = parse_tz_offset, allow_hyphen_values = true)]
+        tz_offset: f64,
+        /// Output: a `.zip` file, or a directory to write the CSVs into.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Compute a Sleep Score for the latest night, live from ring data: Oura's
     /// SleepNet hypnogram → durations/efficiency/latency, bedtime regularity, then
     /// the contributor curves + combiner weights calibrated from a trends export.
@@ -444,6 +465,13 @@ async fn main() -> Result<()> {
         }
         Command::Rdata { action } => cmd_rdata(&cli, &key, action).await,
         Command::Events => cmd_events(&cli).await,
+        Command::ResearchExport {
+            start,
+            end,
+            streams,
+            tz_offset,
+            out,
+        } => cmd_research_export(&cli, start, end, streams.as_deref(), *tz_offset, out),
         Command::Redecode => {
             let store = Store::open(&cli.db)?;
             let (decoded, total) = store.redecode()?;
@@ -1609,4 +1637,57 @@ mod tests {
         assert_ne!(k1, [0u8; 16]);
         assert_ne!(k1, k2);
     }
+}
+
+/// `YYYY-MM-DDTHH:MM[:SS]` at `tz` hours from UTC, or plain unix seconds.
+fn parse_local_time(s: &str, tz: f64) -> Result<f64> {
+    if let Ok(unix) = s.parse::<f64>() {
+        return Ok(unix);
+    }
+    let bad = || anyhow!("expected YYYY-MM-DDTHH:MM or unix seconds, got {s:?}");
+    let (date, time) = s.split_once(['T', ' ']).ok_or_else(bad)?;
+    let d: Vec<i64> = date.split('-').map(|x| x.parse()).collect::<Result<_, _>>().map_err(|_| bad())?;
+    let t: Vec<i64> = time.split(':').map(|x| x.parse()).collect::<Result<_, _>>().map_err(|_| bad())?;
+    if d.len() != 3 || !(2..=3).contains(&t.len()) {
+        return Err(bad());
+    }
+    let days = oura_summary::days_from_civil(d[0], d[1] as u32, d[2] as u32);
+    let local = days * 86_400 + t[0] * 3600 + t[1] * 60 + t.get(2).copied().unwrap_or(0);
+    Ok(local as f64 - tz * 3600.0)
+}
+
+fn cmd_research_export(
+    cli: &Cli,
+    start: &str,
+    end: &str,
+    streams: Option<&str>,
+    tz: f64,
+    out: &std::path::Path,
+) -> Result<()> {
+    use oura_summary::research_export::{self as rx, Stream};
+    let streams = match streams {
+        None => Stream::ALL.to_vec(),
+        Some(list) => list
+            .split(',')
+            .map(|id| Stream::from_id(id).ok_or_else(|| anyhow!("unknown stream {id:?}")))
+            .collect::<Result<_>>()?,
+    };
+    let req = rx::Request {
+        start_unix: parse_local_time(start, tz)?,
+        end_unix: parse_local_time(end, tz)?,
+        streams,
+        tz_offset_hours: tz,
+    };
+    let export = rx::build(&cli.db, &req)?;
+    if out.extension().is_some_and(|e| e == "zip") {
+        std::fs::write(out, rx::to_zip(&export, &rx::bundle_name(req.start_unix, tz))?)?;
+    } else {
+        std::fs::create_dir_all(out)?;
+        for (name, body) in &export.files {
+            std::fs::write(out.join(name), body)?;
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&export.manifest["rows"])?);
+    println!("Wrote {}", out.display());
+    Ok(())
 }

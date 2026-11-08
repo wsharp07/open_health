@@ -78,7 +78,7 @@ enum EventStore {
                 }
                 sqlite3_busy_timeout(db, 5000)
                 let json = source.metadata ? "CASE WHEN tag IN (66,133) THEN COALESCE(decoded_json, '{}') ELSE '{}' END" : "COALESCE(decoded_json, '{}')"
-                let body = source.metadata ? "NULL" : "CASE WHEN tag IN (126,127) THEN body ELSE NULL END"
+                let body = source.metadata ? "NULL" : "CASE WHEN tag IN (114,117,126,127) THEN body ELSE NULL END"
                 let sql = "SELECT ring_timestamp,tag,\(json),captured_unix,\(body) FROM events WHERE (decoded_json IS NOT NULL OR (tag = 65 AND LENGTH(body) >= 14)) AND (\(source.predicate)) ORDER BY captured_unix,id"
                 guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
                     source.fail(ReadError.prepare(message())); finished = true; return

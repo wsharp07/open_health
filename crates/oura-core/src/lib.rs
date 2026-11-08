@@ -376,6 +376,45 @@ pub fn export_database(db_path: String, out_path: String) -> Result<(), SyncErro
         .map_err(|e| storage_failure("export", e, 0))
 }
 
+/// Write the research export (raw per-beat / per-window CSVs for
+/// `[start_unix, end_unix)`, see `oura_summary::research_export`) as a ZIP into
+/// `out_dir` and return its path. Same bytes as the web dashboard and the CLI.
+#[uniffi::export]
+pub fn research_export(
+    db_path: String,
+    start_unix: f64,
+    end_unix: f64,
+    streams: Vec<String>,
+    tz_offset_hours: f64,
+    out_dir: String,
+) -> Result<String, SyncError> {
+    use oura_summary::research_export as rx;
+    let streams = streams
+        .iter()
+        .map(|id| rx::Stream::from_id(id).ok_or_else(|| SyncError::Failed(format!("unknown stream {id:?}"))))
+        .collect::<Result<Vec<_>, _>>()?;
+    let req = rx::Request { start_unix, end_unix, streams, tz_offset_hours };
+    let fail = |e: anyhow::Error| SyncError::Failed(e.to_string());
+    let export = rx::build(std::path::Path::new(&db_path), &req).map_err(fail)?;
+    let name = rx::bundle_name(start_unix, tz_offset_hours);
+    let zip = rx::to_zip(&export, &name).map_err(fail)?;
+    let out = std::path::Path::new(&out_dir).join(format!("{name}.zip"));
+    std::fs::write(&out, zip).map_err(|e| SyncError::Failed(format!("writing {}: {e}", out.display())))?;
+    Ok(out.to_string_lossy().into_owned())
+}
+
+/// Record a research "mark now" at the phone's current time; returns that unix time.
+#[uniffi::export]
+pub fn add_research_marker(db_path: String, label: String) -> Result<f64, SyncError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64 / 1000.0)
+        .unwrap_or(0.0);
+    oura_summary::research_export::add_marker(std::path::Path::new(&db_path), now, &label)
+        .map_err(|e| SyncError::Failed(e.to_string()))?;
+    Ok(now)
+}
+
 /// A live sync session bound to a connected ring: Swift creates it with a writer,
 /// feeds inbound BLE frames via `push_frame`, then awaits `sync`.
 #[derive(uniffi::Object)]

@@ -1,9 +1,10 @@
-// Objective-C++ bridge: run SleepNet (moonstone) through the LibTorch lite
-// interpreter on iOS. Mirrors the input order of tools/run_sleep_model.py:
-//   forward(bedtime, ibi_val, ibi_ts, acm_val, acm_ts, temp_val, temp_ts,
-//           spo2_val, spo2_ts, scalars, tst)
-// and reads stages from output tuple element 1, column 0 (staging[:, 0]).
+// Objective-C++ bridge: run Oura's models through the LibTorch lite interpreter on
+// iOS. Sleep staging is NSSA (sleepstaging_2_6_0), mirroring tools/nssa_stager.py:
+//   forward(acm_values, acm_ts, ibi_values, ibi_ts, temp_values, temp_ts, scalars, bedtime)
+// with its five oura_ops custom ops registered below on top of NssaOps.c.
 #import "TorchBridge.h"
+#include "NssaOps.h"
+#include <torch/library.h>
 #import <Foundation/Foundation.h>
 #include <torch/csrc/jit/mobile/import.h>
 #include <torch/csrc/jit/mobile/module.h>
@@ -59,58 +60,138 @@ static at::Tensor blobFloat2d(const float *p, int64_t rows, int64_t cols) {
     return at::from_blob((void *)p, {rows, cols}, at::kFloat).clone();
 }
 
-int oura_sleepnet(const char *model_path,
-                  const int64_t *ibi_ts, const float *ibi_val, int n_ibi,
-                  const int64_t *acm_ts, const float *acm_val, int n_acm,
-                  const int64_t *temp_ts, const float *temp_val, int n_temp,
-                  int64_t bedtime_start_ms, int64_t bedtime_end_ms,
-                  int *out_stages, int64_t *out_timestamps_ms, int max_out) {
-    if (!model_path || !out_stages || !out_timestamps_ms || max_out <= 0 || n_ibi <= 0) return -1;
+// ---- NSSA (sleepstaging_2_6_0): Oura's custom ops, implemented on NssaOps.c ------
+// Schemas match tools/nssa_ops.py; the .ptl calls them by name through the dispatcher.
+static std::mutex g_classifier_lock;
+static std::vector<uint8_t> g_classifier_blob;
+static std::string g_classifier_path;
+
+void oura_nssa_set_classifier_path(const char *path) {
+    std::lock_guard<std::mutex> lock(g_classifier_lock);
+    if (path && g_classifier_path != path) {
+        g_classifier_path = path;
+        g_classifier_blob.clear();
+    }
+}
+
+static const std::vector<uint8_t> &classifierBlob() {
+    std::lock_guard<std::mutex> lock(g_classifier_lock);
+    if (g_classifier_blob.empty() && !g_classifier_path.empty()) {
+        FILE *f = fopen(g_classifier_path.c_str(), "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0) {
+                g_classifier_blob.resize((size_t)n);
+                if (fread(g_classifier_blob.data(), 1, (size_t)n, f) != (size_t)n) g_classifier_blob.clear();
+            }
+            fclose(f);
+        }
+    }
+    return g_classifier_blob;
+}
+
+static std::tuple<at::Tensor, at::Tensor> op_create_windows(const at::Tensor &timestamps, double window_s) {
+    auto ts = timestamps.reshape({-1}).to(at::kLong).contiguous();
+    const int64_t n_ts = ts.numel();
+    if (n_ts == 0) return {at::zeros({0, 1}, at::kLong), at::full({0, 4}, -1, at::kLong)};
+    const int64_t n = std::max<int64_t>(0, nssa_create_windows(ts.data_ptr<int64_t>(), n_ts, window_s, nullptr, nullptr));
+    auto wts = at::zeros({n}, at::kLong);
+    auto rows = at::full({n, 4}, -1, at::kLong);
+    if (n > 0) nssa_create_windows(ts.data_ptr<int64_t>(), n_ts, window_s, wts.data_ptr<int64_t>(), rows.data_ptr<int64_t>());
+    return {wts.reshape({-1, 1}), rows};
+}
+
+static at::Tensor op_find_indices(const at::Tensor &x, const at::Tensor &xnew) {
+    auto xs = x.reshape({-1}).to(at::kLong).contiguous();
+    auto vs = xnew.reshape({-1}).to(at::kLong).contiguous();
+    auto out = at::zeros({vs.numel()}, at::kLong);
+    if (nssa_find_indices(xs.data_ptr<int64_t>(), xs.numel(), vs.data_ptr<int64_t>(), vs.numel(),
+                          out.data_ptr<int64_t>()) != 0)
+        throw std::runtime_error("oura_find_indices: native code would read past x");
+    return out.reshape(xnew.sizes());
+}
+
+static at::Tensor op_biquad_cascade(const at::Tensor &sos, const at::Tensor &x) {
+    auto s = sos.to(at::kFloat).contiguous();
+    auto v = x.to(at::kFloat).reshape({-1}).contiguous();
+    auto out = at::empty_like(v);
+    if (s.size(0) > 64) throw std::runtime_error("oura_biquad_cascade: too many sections");
+    nssa_biquad_cascade(s.data_ptr<float>(), s.size(0), v.data_ptr<float>(), v.numel(), out.data_ptr<float>());
+    return out.reshape(x.sizes()).to(x.scalar_type());
+}
+
+static at::Tensor op_find_peaks(const at::Tensor &x) {
+    auto v = x.to(at::kFloat).reshape({-1}).contiguous();
+    auto out = at::zeros({std::max<int64_t>(v.numel() / 2, 1)}, at::kLong);
+    const int64_t m = nssa_find_peaks(v.data_ptr<float>(), v.numel(), out.data_ptr<int64_t>());
+    return out.slice(0, 0, m).clone();
+}
+
+static at::Tensor op_sleep_classifier(const at::Tensor &features) {
+    auto f = features.to(at::kFloat).contiguous();
+    if (f.dim() != 2 || f.size(1) != 182) throw std::runtime_error("oura_sleep_classifier expects [N,182]");
+    const auto &blob = classifierBlob();
+    if (blob.empty()) throw std::runtime_error("oura_sleep_classifier: classifier blob missing");
+    auto out = at::empty({f.size(0), 4}, at::kFloat);
+    if (f.size(0) > 0 &&
+        nssa_classifier_predict(blob.data(), (int64_t)blob.size(), f.data_ptr<float>(), f.size(0), f.size(1),
+                                out.data_ptr<float>()) != 0)
+        throw std::runtime_error("oura_sleep_classifier: bad classifier blob");
+    return out;
+}
+
+// The lite build ships no Conjugate/Negative fallbacks, yet NSSA's graph routes a
+// few real-valued ops (numpy_T + mul in its smoothing) through those keys. Real
+// tensors never carry the conj/neg bits, so passing through is exact.
+TORCH_LIBRARY_IMPL(_, Conjugate, m) { m.fallback(torch::CppFunction::makeFallthrough()); }
+TORCH_LIBRARY_IMPL(_, Negative, m) { m.fallback(torch::CppFunction::makeFallthrough()); }
+
+TORCH_LIBRARY(oura_ops, m) {
+    m.def("oura_create_windows(Tensor timestamps, float window_s) -> (Tensor, Tensor)", op_create_windows);
+    m.def("oura_find_indices(Tensor x, Tensor xnew) -> Tensor", op_find_indices);
+    m.def("oura_biquad_cascade(Tensor sos, Tensor x) -> Tensor", op_biquad_cascade);
+    m.def("oura_find_peaks(Tensor x) -> Tensor", op_find_peaks);
+    m.def("oura_sleep_classifier(Tensor features) -> Tensor", op_sleep_classifier);
+}
+
+int oura_nssa(const char *model_path,
+              const int64_t *acm_ts, const float *acm_val, int n_acm,
+              const int64_t *ibi_ts, const float *ibi_val, int n_ibi,
+              const int64_t *temp_ts, const float *temp_val, int n_temp,
+              const float *demographics, int64_t bedtime_start_ms, int64_t bedtime_end_ms,
+              int *out_stages, int64_t *out_timestamps_ms, int max_out) {
+    if (!model_path || !demographics || !out_stages || !out_timestamps_ms || max_out <= 0
+        || n_acm <= 0 || n_ibi <= 0 || n_temp <= 0) return -1;
     std::lock_guard<std::mutex> lock(g_torch);
     try {
         auto &m = cachedModule(model_path, g_sleepnet.module, g_sleepnet.path);
-
-        auto ibi_ts_t = blobLong(ibi_ts, n_ibi);
-        auto ibi_val_t = blobFloat2d(ibi_val, n_ibi, 3);
-        auto acm_ts_t = blobLong(acm_ts, n_acm);
-        auto acm_val_t = blobFloat2d(acm_val, n_acm, 1);
-        auto temp_ts_t = blobLong(temp_ts, n_temp);
-        auto temp_val_t = blobFloat2d(temp_val, n_temp, 1);
-
         int64_t bt[2] = {bedtime_start_ms, bedtime_end_ms};
-        auto bedtime = blobLong(bt, 2);
-        auto spo2_val = at::empty({0, 1}, at::kFloat);
-        auto spo2_ts = at::empty({0}, at::kLong);
-        float sc[5] = {35.f, 25.f, 0.f, 0.f, 0.f};
-        auto scalars = at::from_blob(sc, {5}, at::kFloat).clone();
-        float tstv[1] = {300.f};
-        auto tst = at::from_blob(tstv, {1}, at::kFloat).clone();
-
-        std::vector<c10::IValue> inputs{bedtime, ibi_val_t, ibi_ts_t, acm_val_t, acm_ts_t,
-                                        temp_val_t, temp_ts_t, spo2_val, spo2_ts, scalars, tst};
+        std::vector<c10::IValue> inputs{
+            blobFloat2d(acm_val, n_acm, 6), blobLong(acm_ts, n_acm),
+            blobFloat2d(ibi_val, n_ibi, 3), blobLong(ibi_ts, n_ibi),
+            at::from_blob((void *)temp_val, {n_temp}, at::kFloat).clone(), blobLong(temp_ts, n_temp),
+            at::from_blob((void *)demographics, {3}, at::kFloat).clone(), blobLong(bt, 2)};
         auto out = m.forward(inputs).toTuple();
-        auto staging = out->elements()[1].toTensor();           // [epochs, channels]
-        if (staging.dim() < 2 || staging.size(1) < 1) {
-            NSLog(@"oura_sleepnet: unexpected staging shape");
+        auto stages = out->elements()[1].toTensor();               // [epochs, 1 + 4 probs]
+        if (stages.dim() < 2 || stages.size(1) < 1) {
+            NSLog(@"oura_nssa: unexpected stage shape");
             return -1;
         }
-        auto col0 = staging.select(1, 0).to(at::kInt).contiguous();
+        auto col0 = stages.select(1, 0).to(at::kDouble).round().to(at::kInt).contiguous();
         auto timestamps = out->elements()[0].toTensor().to(at::kLong).reshape({-1}).contiguous();
         if (timestamps.numel() != col0.numel() || col0.numel() > max_out) {
-            NSLog(@"oura_sleepnet: mismatched timestamps or output exceeds buffer");
+            NSLog(@"oura_nssa: mismatched timestamps or output exceeds buffer");
             return -1;
         }
-        int n = (int)col0.numel();
+        const int n = (int)col0.numel();
         const int64_t *ts = timestamps.data_ptr<int64_t>();
-        for (int i = 0; i < n; i++) out_timestamps_ms[i] = ts[i];
         const int *acc = col0.data_ptr<int>();
-        for (int i = 0; i < n; i++) out_stages[i] = acc[i];
-        if ((int)col0.numel() > max_out) {
-            NSLog(@"oura_sleepnet: truncated %d epochs to %d", (int)col0.numel(), max_out);
-        }
+        for (int i = 0; i < n; i++) { out_timestamps_ms[i] = ts[i]; out_stages[i] = acc[i]; }
         return n;
     } catch (const std::exception &e) {
-        NSLog(@"oura_sleepnet: %s", e.what());
+        NSLog(@"oura_nssa: %s", e.what());
         return -1;
     }
 }

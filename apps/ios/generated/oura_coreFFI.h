@@ -331,6 +331,11 @@ void uniffi_oura_core_fn_init_callback_vtable_blewriter(UniffiVTableCallbackInte
 void uniffi_oura_core_fn_init_callback_vtable_syncprogresslistener(UniffiVTableCallbackInterfaceSyncProgressListener* _Nonnull vtable
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_ADD_RESEARCH_MARKER
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_ADD_RESEARCH_MARKER
+double uniffi_oura_core_fn_func_add_research_marker(RustBuffer db_path, RustBuffer label, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_BACKUP_DATABASE
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_BACKUP_DATABASE
 uint64_t uniffi_oura_core_fn_func_backup_database(RustBuffer db_path, RustBuffer dest_path, RustCallStatus *_Nonnull out_status
@@ -365,6 +370,11 @@ RustBuffer uniffi_oura_core_fn_func_hourly_hr_json(RustBuffer db_path, int64_t t
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_QUICK_SUMMARY_JSON
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_QUICK_SUMMARY_JSON
 RustBuffer uniffi_oura_core_fn_func_quick_summary_json(RustBuffer db_path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_RESEARCH_EXPORT
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_RESEARCH_EXPORT
+RustBuffer uniffi_oura_core_fn_func_research_export(RustBuffer db_path, double start_unix, double end_unix, RustBuffer streams, double tz_offset_hours, RustBuffer out_dir, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_RMSSD
@@ -657,6 +667,12 @@ void ffi_oura_core_rust_future_free_void(uint64_t handle
 void ffi_oura_core_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_ADD_RESEARCH_MARKER
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_ADD_RESEARCH_MARKER
+uint16_t uniffi_oura_core_checksum_func_add_research_marker(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_BACKUP_DATABASE
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_BACKUP_DATABASE
 uint16_t uniffi_oura_core_checksum_func_backup_database(void
@@ -696,6 +712,12 @@ uint16_t uniffi_oura_core_checksum_func_hourly_hr_json(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_QUICK_SUMMARY_JSON
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_QUICK_SUMMARY_JSON
 uint16_t uniffi_oura_core_checksum_func_quick_summary_json(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_RESEARCH_EXPORT
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_RESEARCH_EXPORT
+uint16_t uniffi_oura_core_checksum_func_research_export(void
     
 );
 #endif

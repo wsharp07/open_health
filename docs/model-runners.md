@@ -10,7 +10,7 @@ each can and can't do.
 | tool | model(s) | output | status |
 | --- | --- | --- | --- |
 | `oura sessions` / `tools/run_activity_model.py` | `automatic_activity_detection_3_1_11` | activity/workout segments + type label | ✅ runs |
-| `tools/run_sleep_model.py` | `sleepnet_moonstone_1_2_0` | DEEP/LIGHT/REM/WAKE hypnogram + efficiency | ✅ runs |
+| `tools/run_sleep_model.py` | `sleepstaging_2_6_0` (NSSA, the official app's stager) | DEEP/LIGHT/REM/WAKE hypnogram per ring bedtime + efficiency | ✅ runs (custom ops + classifier, see [sleep-staging.md](algorithms/sleep-staging.md)) |
 | `tools/run_models.py bdi` | `sleepnet_bdi_0_4_0` | hypnogram + apnea/breathing-disturbance | ✅ runs |
 | `tools/run_cva_model.py` | `cva_2_1_0` | cardiovascular (vascular) age + pulse-wave velocity | ✅ runs (needs `cva_ppg` on — see [cva-cardiovascular-age.md](cva-cardiovascular-age.md)) |
 | `tools/run_spo2.py` | (no model — Oura's calibration) | overnight SpO2 % | ✅ runs (see [spo2-calibration.md](spo2-calibration.md)) |
@@ -32,8 +32,6 @@ Of the ~26 newest-version models, most are blocked on a signal we can't get:
 - **bioZ + EDA sensors** — `atlas` (not in our event stream).
 - **cloud-computed scores** — `stress_resilience`, `training_stress_score`.
 - **cycle / pregnancy inputs** — `popsicle`, `pregnancy_biometrics`.
-- **a custom C++ op** missing in the runtime — `sleepstaging_2_6_0`
-  (`oura_ops::oura_create_windows`).
 - **pipeline deps** (need another model's / cloud output first) — `cumulative_stress`,
   `cva_calibrator`, `stress_daytime_sensing`.
 

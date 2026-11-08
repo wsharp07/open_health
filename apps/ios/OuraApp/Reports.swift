@@ -161,6 +161,31 @@ enum Sleep {
                               hrDeep: h[1], hrLight: h[2], hrRem: h[3])
     }
 
+    /// Hypnograms from Oura's own staging (NSSA or the ring) are shown verbatim.
+    /// Mirrors `oura-summary::is_oura_staging`.
+    static func isOuraStaging(_ source: String?) -> Bool { source == "nssa" || source == "ring" }
+
+    /// Android SleepPhaseConverter.aggregate30SecTo5Min: drop codes outside 1...4, cut
+    /// into 10-epoch windows (last partial), skip windows < 5, AWAKE when >= 4 awake,
+    /// else the most frequent stage, ties AWAKE > DEEP > REM > LIGHT.
+    /// Mirrors `oura-summary::aggregate_30s_to_5min`.
+    static func aggregate5Min(_ stages: [Int]) -> [Int] {
+        let codes = stages.filter { (1...4).contains($0) }
+        var out: [Int] = []
+        var i = 0
+        while i < codes.count {
+            let w = codes[i..<min(i + 10, codes.count)]
+            i += 10
+            if w.count < 5 { continue }
+            var counts = [0, 0, 0, 0, 0]
+            for c in w { counts[c] += 1 }
+            if counts[4] >= 4 { out.append(4); continue }
+            let top = counts[1...4].max() ?? 0
+            out.append([4, 1, 3, 2].first { counts[$0] >= top } ?? 4)
+        }
+        return out
+    }
+
     /// Mode filter over a centered odd window — removes single-epoch flicker so cycle /
     /// awakening counts reflect real architecture, not 30 s noise.
     static func smooth(_ v: [Int], _ win: Int) -> [Int] {
@@ -589,7 +614,7 @@ extension Summary {
         for n in nights {
             guard let day = wakeYmd(n) else { continue }
             guard n.stagingComplete else { incompleteDays.insert(day); continue }
-            let actual = Double(Sleep.asleepS(Sleep.smooth(n.hypnogram ?? [], 5),
+            let actual = Double(Sleep.asleepS(n.analysisStages,
                                               inBedS: n.durationS))
             if actual > 0 { byDay[day, default: 0] += actual }
         }
@@ -694,7 +719,7 @@ struct Polysomnograph: View {
     private let laneH: CGFloat = 44
     private let axisH: CGFloat = 18
 
-    private struct Lane { let label: String; let unit: String; let signal: SignalLane?; let stages: [Int]? }
+    private struct Lane { let label: String; let unit: String; let signal: SignalLane?; let stages: [Int]?; var stageSpan: [Double]? = nil }
     private struct SignalLane {
         let v: [Double]
         let color: Color
@@ -706,7 +731,14 @@ struct Polysomnograph: View {
 
     private var lanes: [Lane] {
         var out: [Lane] = []
-        if let st = night.hypnogram, st.count > 1 { out.append(Lane(label: "Hypnogram", unit: "", signal: nil, stages: Sleep.smooth(st, 5))) }
+        // The official app's main chart: 5-minute blocks laid from the first NSSA epoch.
+        if let st5 = night.stages_5min, !st5.isEmpty, let s0 = night.start_unix, let e0 = night.end_unix, e0 > s0 {
+            let t0 = night.stages_t0_unix ?? Double(s0)
+            let span = Double(e0 - s0)
+            let a = (t0 - Double(s0)) / span, b = (t0 + Double(st5.count) * 300 - Double(s0)) / span
+            out.append(Lane(label: "Hypnogram · 5 min (Oura app)", unit: "", signal: nil, stages: st5, stageSpan: [a, b]))
+        }
+        if let st = night.hypnogram, st.count > 1 { out.append(Lane(label: "Hypnogram", unit: "", signal: nil, stages: night.analysisStages)) }
         func sig(_ label: String, _ unit: String, _ v: [Double]?, _ color: Color,
                  _ dp: Int = 0, span: [Double]? = nil, times: [Double]? = nil,
                  rawTimed: [[Double]]? = nil) {
@@ -786,7 +818,7 @@ struct Polysomnograph: View {
             }
             .frame(width: gutterW, alignment: .leading)
             Group {
-                if let st = lane.stages { HypnoCanvas(stages: st) }
+                if let st = lane.stages { HypnoCanvas(stages: st, span: lane.stageSpan) }
                 else if let s = lane.signal { SignalCanvas(v: s.v, color: s.color, span: s.span, times: s.times, timed: s.timed) }
             }
             .frame(width: plotW, height: h)
@@ -795,6 +827,12 @@ struct Polysomnograph: View {
     }
 
     private func gutterValue(_ lane: Lane) -> String {
+        if let st = lane.stages, let sp = lane.stageSpan {
+            guard let f = cursorF else { return "" }
+            guard f >= sp[0], f < sp[1] else { return "—" }
+            let local = (f - sp[0]) / max(1e-9, sp[1] - sp[0])
+            return stageName(st[min(st.count - 1, max(0, Int(local * Double(st.count))))])
+        }
         if let st = lane.stages {
             guard let f = cursorF else { return "" }
             let code = st[min(st.count - 1, max(0, Int(f * Double(st.count - 1))))]
@@ -839,14 +877,19 @@ struct Polysomnograph: View {
 // stepped clinical hypnogram: y = stage level (Awake top → Deep bottom), colored runs.
 private struct HypnoCanvas: View {
     let stages: [Int]
+    /// When set, the stages are blocks spanning [span0, span1] of the night (edge mapping).
+    var span: [Double]? = nil
     var body: some View {
         Canvas { ctx, size in
             let n = stages.count
-            guard n > 1 else { return }
+            guard n > (span == nil ? 1 : 0) else { return }
             let padT: CGFloat = 8, plotH = size.height - 16
             let lvl = { (c: Int) -> CGFloat in switch c { case 1: return 3; case 2: return 2; case 3: return 1; default: return 0 } }
             let yOf = { (l: CGFloat) in padT + l / 3 * plotH }
-            let xOf = { (i: Int) in size.width * CGFloat(i) / CGFloat(n - 1) }
+            let xOf = { (i: Int) -> CGFloat in
+                if let sp = span { return size.width * CGFloat(sp[0] + (sp[1] - sp[0]) * Double(i) / Double(n)) }
+                return size.width * CGFloat(i) / CGFloat(n - 1)
+            }
             for l in 0..<4 {
                 let y = yOf(CGFloat(l))
                 ctx.stroke(Path { $0.move(to: CGPoint(x: 0, y: y)); $0.addLine(to: CGPoint(x: size.width, y: y)) },
@@ -858,7 +901,7 @@ private struct HypnoCanvas: View {
                 if code == 0 { prev = nil; i += 1; continue }
                 var j = i
                 while j < n, stages[j] == code { j += 1 }
-                let x1 = xOf(i), x2 = xOf(min(j, n - 1)), y = yOf(lvl(code))
+                let x1 = xOf(i), x2 = xOf(span == nil ? min(j, n - 1) : j), y = yOf(lvl(code))
                 if let p = prev {
                     ctx.stroke(Path { $0.move(to: CGPoint(x: x1, y: p)); $0.addLine(to: CGPoint(x: x1, y: y)) },
                                with: .color(Obs.trace.opacity(0.6)), lineWidth: 0.8)
@@ -1531,7 +1574,7 @@ struct SleepReport: View {
 
     var body: some View {
         if let n = s.night(forDay: day) {
-            let metrics = (n.hypnogram.flatMap { st in Sleep.metrics(Sleep.smooth(st, 5), inBedS: n.durationS) })
+            let metrics = (n.hypnogram.flatMap { st in Sleep.metrics(Sleep.isOuraStaging(n.staging_source) ? st : Sleep.smooth(st, 5), inBedS: n.durationS) })
             let asleepH = metrics.map { $0.asleepMin / 60 }
 
             // summary strip
@@ -1581,7 +1624,7 @@ struct SleepReport: View {
                 if let m = metrics { clinicalGrid(m) }
 
                 let auto = Sleep.autonomic(night: n,
-                                           stages: Sleep.smooth(n.hypnogram ?? [], 5))
+                                           stages: n.analysisStages)
                 if auto.any {
                     Rule("HR & HRV by stage")
                     autonomicGrid(auto)

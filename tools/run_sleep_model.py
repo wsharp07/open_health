@@ -1,33 +1,36 @@
 #!/usr/bin/env python3
-"""Run Oura's decrypted SleepNet (moonstone) model on our stored ring data to
-extract a per-30s hypnogram (DEEP/LIGHT/REM/WAKE).
+"""Stage sleep with Oura's NSSA model (sleepstaging_2_6_0) — the hypnogram the
+official app shows — on our stored ring data.
 
-Inputs from the SQLite event log: IBI (0x60), motion_seconds (0x47), temp (0x46),
-bedtime (0x76). SpO2 passed empty (we only have R-ratio, not %). Time axis uses per-boot clock anchors and the bedtime capture epoch.
+Each night window from the summary is staged per ring `bedtime_period` (0x76)
+inside it, exactly as the Android app stages each bedtime (see
+docs/algorithms/sleep-staging.md). Inputs: sleep ACM periods (0x72), IBI (0x60,
+ecore-corrected), sleep temperature (0x75) and the profile demographics.
 
-Usage: python tools/run_sleep_model.py START_DS END_DS [DB] [TZ=1]
-       (no args → uses the bedtime_period in the DB)
-       --batch reads a JSON array of [start_ds, end_ds] pairs from stdin and emits
-       a JSON array of results, loading the model + scanning the DB only once (the
-       dashboard uses this to score every night in a single process).
+Usage: python tools/run_sleep_model.py START_DS END_DS [DB] [TZ=1] [--json]
+       (no args → the most recent bedtime_period in the DB)
+       --batch reads a JSON array of [start_ds, end_ds, captured_unix] from stdin and
+       emits a JSON array of results (null for windows that can't be staged).
+Results are cached per input fingerprint next to the DB (nssa_cache.json), so the
+dashboard only stages new nights.
 """
-import sys, json, sqlite3, datetime
+import datetime
+import hashlib
+import json
+import sqlite3
+import sys
 from pathlib import Path
-import torch
 
 from _common import resolve_db, resolve_models_dir
-from sleep_inputs import aligned_stages, collect_inputs, refine_deep_stages
+from epoch_time import build_epochs, is_dated, make_unix_s
+from nssa_inputs import TAG_BEDTIME, collect_nssa_inputs
+from ibi_correction import correct_ibis
 
 REPO = Path(__file__).resolve().parent.parent
 TZ = 1.0
-MODEL_NAME = "sleepnet_moonstone_1_2_0.pt"
-_model_path = resolve_models_dir(REPO, MODEL_NAME) / MODEL_NAME
-if not _model_path.is_file():
-    _ios_ptl = REPO / "apps" / "ios" / "OuraApp" / "Resources" / "models" / "sleepnet_moonstone_1_2_0.ptl"
-    if _ios_ptl.is_file():
-        _model_path = _ios_ptl
-MODEL = str(_model_path)
 STAGE = {1: "DEEP", 2: "LIGHT", 3: "REM", 4: "WAKE"}
+CACHE_VERSION = "nssa-2.6.0-r1"
+EPOCH_MS = 30000
 
 JSON = "--json" in sys.argv
 BATCH = "--batch" in sys.argv
@@ -43,112 +46,185 @@ if len(rest) > 1:
     TZ = float(rest[1])
 DB = resolve_db(db_arg, REPO)
 
+
+def read_profile(db):
+    """profile.json next to the DB (same defaults as oura-summary Demographics)."""
+    profile = {"sex": "M", "age": 30.0, "height_m": 1.78, "weight_kg": 75.0}
+    try:
+        profile.update(json.loads((Path(db).parent / "profile.json").read_text()))
+    except (OSError, ValueError):
+        pass
+    return profile
+
+
 con = sqlite3.connect(str(DB))
-rows = con.execute("SELECT ring_timestamp, tag, COALESCE(decoded_json, '{}'), captured_unix FROM events "
+rows = con.execute("SELECT ring_timestamp, tag, COALESCE(decoded_json, '{}'), captured_unix, body FROM events "
                    "WHERE decoded_json IS NOT NULL OR (tag = 65 AND LENGTH(body) >= 14) "
                    "ORDER BY captured_unix, id").fetchall()
-# Anchor ring deciseconds to wall-clock per boot epoch (ds resets on reboot; a single
-# global anchor mis-dates older epochs — see epoch_time / crates/oura-summary).
-from epoch_time import build_epochs, is_dated, make_unix_s
-_epochs = build_epochs(rows)
+_epochs = build_epochs([r[:4] for r in rows])
 _unix_s = make_unix_s(_epochs)
-def ms(ds, cu=None):  # device deciseconds -> absolute epoch ms (int64), consistent across signals
+
+
+def ms(ds, cu=None):
     u = _unix_s(ds, cu)
-    return int(u * 1000) if u is not None else int(ds * 100)
+    return int(round(u * 1000)) if u is not None else int(ds * 100)
+
+
 def hm(ms_):
-    return datetime.datetime.utcfromtimestamp(ms_/1000 + TZ*3600).strftime("%H:%M")
-
-# load the SleepNet (moonstone) model once; batch mode reuses it across nights.
-MODEL_M = torch.jit.load(MODEL, map_location="cpu").eval()
+    return datetime.datetime.utcfromtimestamp(ms_ / 1000 + TZ * 3600).strftime("%H:%M")
 
 
-def _collect_window_vitals(start_ds, end_ds, bed_cu):
-    start_ms, end_ms = ms(start_ds, bed_cu), ms(end_ds, bed_cu)
-    hr_t, hrv_t, motion_t = [], [], []
-    for ds, tag, js, cu in rows:
-        if not start_ds - 6000 <= ds <= end_ds + 6000:
+_decoded = None
+
+
+def decoded_rows():
+    global _decoded
+    if _decoded is None:
+        _decoded = [(ds, tag, json.loads(js), cu, bytes(body) if body is not None else None)
+                    for ds, tag, js, cu, body in rows if tag in (0x60, 0x72, 0x75)]
+    return _decoded
+
+
+def ring_bedtimes(start_ds, end_ds, captured):
+    """The ring's bedtime periods inside a summary window: the latest 0x76 per start
+    (the app replaces an interim result whenever the ring extends its bedtime)."""
+    latest = {}
+    for ds, tag, js, cu, _body in rows:
+        if tag != TAG_BEDTIME:
             continue
-        t = ms(ds, cu)
-        if not start_ms - 600000 <= t <= end_ms + 600000:
+        v = json.loads(js)
+        s, e = v.get("bedtime_start_ds"), v.get("bedtime_end_ds")
+        if s is None or e is None or e <= s:
             continue
-        if abs(t - (start_ms + (ds - start_ds) * 100)) > 300000:
+        if abs(ms(s, cu) - ms(s, captured)) > 300000:  # another boot's counter
             continue
-        if tag == 0x5D:
-            v = json.loads(js)
-            step_ds = max(1, int(v.get("interval_min", 5) or 5)) * 600
-            for i, x in enumerate(v.get("hr_bpm", []) or []):
-                if x and float(x) > 0:
-                    hr_t.append((ds + i * step_ds, float(x)))
-            for i, x in enumerate(v.get("rmssd_ms", []) or []):
-                if x and float(x) > 0:
-                    hrv_t.append((ds + i * step_ds, float(x)))
-        elif tag == 0x47:
-            v = json.loads(js)
-            if v.get("motion_seconds") is not None:
-                motion_t.append((ds, float(v["motion_seconds"])))
-    return hr_t, hrv_t, motion_t
+        if s < end_ds and e > start_ds:
+            latest[s] = (s, e, cu)
+    return sorted(latest.values())
+
+
+_stager = None
+_cache = None
+_cache_path = Path(DB).parent / "nssa_cache.json"
+
+
+def stager():
+    global _stager
+    if _stager is None:
+        from nssa_stager import MODEL_NAME, NssaStager
+        _stager = NssaStager(resolve_models_dir(REPO, MODEL_NAME) / MODEL_NAME)
+    return _stager
+
+
+def cache():
+    global _cache
+    if _cache is None:
+        try:
+            _cache = json.loads(_cache_path.read_text())
+            if _cache.get("version") != CACHE_VERSION:
+                _cache = {"version": CACHE_VERSION, "nights": {}}
+        except (OSError, ValueError):
+            _cache = {"version": CACHE_VERSION, "nights": {}}
+    return _cache
+
+
+def save_cache():
+    try:
+        _cache_path.write_text(json.dumps(cache()))
+    except OSError:
+        pass
+
+
+def stage_bedtime(b_start, b_end, cu, demo):
+    """NSSA epochs for one ring bedtime: (epoch start ms list, codes) or None."""
+    inputs = collect_nssa_inputs(decoded_rows(), b_start, b_end, cu, ms, correct_ibis)
+    key = hashlib.sha256(json.dumps([CACHE_VERSION, demo, inputs], sort_keys=True).encode()).hexdigest()
+    hit = cache()["nights"].get(key)
+    if hit is not None:
+        return (hit["t"], hit["s"]) if hit else None
+    try:
+        ts, codes = stager().stage(inputs, demo)
+    except (ValueError, RuntimeError):
+        ts, codes = None, None
+    cache()["nights"][key] = {"t": ts, "s": codes} if ts else {}
+    save_cache()
+    return (ts, codes) if ts else None
+
+
+def grid_stages(periods, failed, start_ms, end_ms):
+    """Paint NSSA epochs onto the summary's 30 s grid from start_ms. A cell takes the
+    epoch covering its midpoint (NSSA epochs sit on floor30(bedtime start), so they
+    may be offset from start_ms by up to 29 s). Cells outside every ring bedtime
+    (the summary's evidence-based extensions, or the gap of a rejoined split night)
+    are WAKE, as Oura's own grid fills unstaged epochs (`nan_to_num(…, 4)`); cells of
+    a ring bedtime that NSSA could not stage stay 0 (unknown)."""
+    n = max(1, -(-(end_ms - start_ms) // EPOCH_MS))
+    out = [4] * n
+    for b_start_ms, b_end_ms in failed:
+        for idx in range(n):
+            mid = start_ms + idx * EPOCH_MS + EPOCH_MS // 2
+            if b_start_ms <= mid < b_end_ms:
+                out[idx] = 0
+    for ts, codes in periods:
+        for t, code in zip(ts, codes):
+            # the cell whose midpoint falls inside [t, t + 30 s)
+            idx = -(-(t - start_ms - EPOCH_MS // 2) // EPOCH_MS)
+            if 0 <= idx < n and code in (1, 2, 3, 4):
+                out[idx] = code
+    return out
 
 
 def score_window(start_ds, end_ds, captured_unix=None):
-    """Score one bedtime window. Returns (out_dict, ts, stages) or (err_str, None, None)."""
-    bed_cu = captured_unix if captured_unix is not None else next((cu for ds, tag, js, cu in reversed(rows) if tag in (0x76, 0x4E) and
-                   (json.loads(js).get("bedtime_start_ds") == start_ds or json.loads(js).get("bedtime_start") == start_ds)), None)
-    if bed_cu is not None and (not is_dated(_epochs, start_ds, bed_cu) or not is_dated(_epochs, end_ds, bed_cu)):
+    """Stage one summary window. Returns (out_dict, None, None) or (err_str, ...)."""
+    bed_cu = captured_unix if captured_unix is not None else next(
+        (cu for ds, tag, js, cu, _b in reversed(rows) if tag == TAG_BEDTIME
+         and json.loads(js).get("bedtime_start_ds") == start_ds), rows[-1][3] if rows else 0)
+    if not is_dated(_epochs, start_ds, bed_cu) or not is_dated(_epochs, end_ds, bed_cu):
         return "sleep window clock is undated or ambiguous", None, None
-    decoded_rows = ((ds, tag, json.loads(js), cu) for ds, tag, js, cu in rows)
-    beats, acm, temp = collect_inputs(decoded_rows, start_ds, end_ds, bed_cu, ms)
-    if not beats or not any(b[3] == 1 for b in beats):
-        return "not enough valid IBI in this window", None, None
-
-    def col(seq, i):
-        return [r[i] for r in seq]
-    ibi_ts = torch.tensor(col(beats, 0), dtype=torch.int64)
-    ibi_val = torch.tensor([[b[1], b[2], b[3]] for b in beats], dtype=torch.float32)
-    acm_ts = torch.tensor(col(acm, 0), dtype=torch.int64)
-    acm_val = torch.tensor([[a[1]] for a in acm], dtype=torch.float32)
-    temp_ts = torch.tensor(col(temp, 0), dtype=torch.int64)
-    temp_val = torch.tensor([[t[1]] for t in temp], dtype=torch.float32)
-    bedtime = torch.tensor([ms(start_ds, bed_cu), ms(end_ds, bed_cu)], dtype=torch.int64)
-    spo2_val = torch.empty(0, 1, dtype=torch.float32)
-    spo2_ts = torch.empty(0, dtype=torch.int64)
-    scalars = torch.tensor([35, 25, 0, 0, 0], dtype=torch.float32)
-    tst = torch.tensor([300.0], dtype=torch.float32)
-
-    with torch.no_grad():
-        ts, staging, apnea, spo2_out, metrics, debug = MODEL_M(
-            bedtime, ibi_val, ibi_ts, acm_val, acm_ts, temp_val, temp_ts,
-            spo2_val, spo2_ts, scalars, tst)
-
-    stages = [int(s) for s in staging[:, 0].tolist()]
-    if not stages:
-        return "SleepNet-moonstone returned zero epochs for this window", None, None
-    stages = aligned_stages(ts.reshape(-1).tolist(), stages, ms(start_ds, bed_cu), ms(end_ds, bed_cu))
+    profile = read_profile(DB)
+    from nssa_stager import demographics
+    demo = demographics(profile["age"], profile["height_m"], profile["weight_kg"], profile["sex"])
+    beds = ring_bedtimes(start_ds, end_ds, bed_cu)
+    bedtime_source = "ring"
+    if not beds:  # no ring bedtime (signal-derived night): stage the summary window
+        beds, bedtime_source = [(start_ds, end_ds, bed_cu)], "summary"
+    periods, failed = [], []
+    for b_start, b_end, cu in beds:
+        staged = stage_bedtime(b_start, b_end, bed_cu, demo)
+        if staged:
+            periods.append(staged)
+        else:
+            failed.append((ms(b_start, bed_cu), ms(b_end, bed_cu)))
+    if not periods:
+        return "NSSA could not stage this window (missing ACM, IBI or sleep temperature)", None, None
+    start_ms, end_ms = ms(start_ds, bed_cu), ms(end_ds, bed_cu)
+    stages = grid_stages(periods, failed, start_ms, end_ms)
     n = len(stages)
-    if n == 0:
-        return "SleepNet-moonstone returned zero epochs for this window", None, None
-    if 1 not in stages:
-        hr_t, hrv_t, motion_t = _collect_window_vitals(start_ds, end_ds, bed_cu)
-        stages = refine_deep_stages(stages, hr_t, hrv_t, motion_t, start_ds, end_ds)
+    known = [c for c in stages if c]
     mins = {k: stages.count(c) * 0.5 for c, k in STAGE.items()}
     asleep = sum(mins[k] for k in ("DEEP", "LIGHT", "REM"))
-    in_bed = n * 0.5
+    main = max(periods, key=lambda p: len(p[1]))
     out = {
         "start_ds": start_ds, "end_ds": end_ds, "captured_unix": bed_cu,
-        "start_local": hm(int(ts[0])), "end_local": hm(int(ts[-1])),
-        "epochs": n, "in_bed_min": in_bed,
-        "asleep_min": asleep, "efficiency_pct": round(100 * asleep / in_bed) if all(stages) else None,
-        "source": "sleepnet",
-        "stages": stages,  # per-30s ints: 1=DEEP 2=LIGHT 3=REM 4=WAKE
+        "start_local": hm(start_ms), "end_local": hm(end_ms),
+        "epochs": n, "in_bed_min": n * 0.5,
+        "asleep_min": asleep,
+        "efficiency_pct": round(100 * asleep / (n * 0.5)) if len(known) == n else None,
+        "source": "nssa",
+        "bedtime_source": bedtime_source,
+        "stages": stages,  # per-30s ints on the summary grid: 1=DEEP 2=LIGHT 3=REM 4=WAKE 0=unknown
+        "stages_t0_unix": main[0][0] / 1000.0,
+        # Oura's own epochs per ring bedtime: start ms of epoch 0 and the codes.
+        "nssa_periods": [{"t0_ms": ts[0], "stages": codes} for ts, codes in periods],
+        "demographics": demo,
     }
     for c, k in STAGE.items():
         out[k.lower() + "_min"] = mins[k]
-        out[k.lower() + "_pct"] = round(100 * mins[k] / in_bed)
-    return out, ts, stages
+        out[k.lower() + "_pct"] = round(100 * mins[k] / (n * 0.5))
+    return out, None, None
 
 
 if BATCH:
-    # one process, every night: read [[start,end], ...] from stdin, emit a JSON
-    # array (null for any window that couldn't be scored).
     pairs = json.load(sys.stdin)
     results = []
     for p in pairs:
@@ -157,34 +233,26 @@ if BATCH:
     print(json.dumps(results))
     sys.exit(0)
 
-if start_ds is None:  # default: most recent bedtime_period in the DB (matches run_models.last_bedtime)
+if start_ds is None:  # default: most recent bedtime_period in the DB
     bt = con.execute("SELECT decoded_json FROM events WHERE tag=118 ORDER BY captured_unix DESC, id DESC").fetchone()
     if bt is None:
         raise SystemExit("no bedtime_period (tag 0x76) in DB — pass start/end deciseconds or sync overnight data first")
     v = json.loads(bt[0])
     start_ds, end_ds = v["bedtime_start_ds"], v["bedtime_end_ds"]
 
-out, ts, stages = score_window(start_ds, end_ds)
+out, _, _ = score_window(start_ds, end_ds)
 if not isinstance(out, dict):
-    sys.exit(out)  # error string
-
+    sys.exit(out)
 if JSON:
     print(json.dumps(out))
     sys.exit(0)
 
 n = out["epochs"]
-in_bed = out["in_bed_min"]
-print(f"window ds [{start_ds}..{end_ds}] ({(end_ds-start_ds)/10/3600:.1f}h)")
-print(f"\nHypnogram: {n} epochs = {n*0.5:.0f} min in bed")
+print(f"window ds [{start_ds}..{end_ds}] ({(end_ds - start_ds) / 10 / 3600:.1f}h), NSSA bedtime from {out['bedtime_source']}")
+print(f"\nHypnogram: {n} epochs = {n * 0.5:.0f} min in bed")
 for k in ["DEEP", "LIGHT", "REM", "WAKE"]:
-    print(f"  {k:<6} {out[k.lower()+'_min']:>6.0f} min  ({out[k.lower()+'_pct']:4.0f}%)")
-print(f"  asleep {out['asleep_min']:.0f} min,  sleep efficiency {out['efficiency_pct']:.0f}%")
-
-# compact timeline: one glyph per ~10 min (20 epochs), majority stage
-g = {1: "D", 2: "L", 3: "R", 4: "W"}
-print(f"\n  {hm(int(ts[0]))} ", end="")
-for i in range(0, n, 20):
-    blk = stages[i:i+20]
-    maj = max(set(blk), key=blk.count)
-    print(g.get(maj, "?"), end="")
-print(f" {hm(int(ts[-1]))}   (D=deep L=light R=rem W=wake, ~10min/char)")
+    print(f"  {k:<6} {out[k.lower() + '_min']:>6.0f} min  ({out[k.lower() + '_pct']:4.0f}%)")
+g = {1: "D", 2: "L", 3: "R", 4: "W", 0: "."}
+stages = out["stages"]
+print(f"\n  {out['start_local']} " + "".join(g[max(set(stages[i:i + 20]), key=stages[i:i + 20].count)]
+                                            for i in range(0, n, 20)) + f" {out['end_local']}")

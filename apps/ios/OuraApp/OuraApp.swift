@@ -458,6 +458,14 @@ struct SyncView: View {
                     Task { if let url = await ring.exportRawDatabase() { diagnosticFile = url } }
                 }
                 SupportDivider()
+                NavigationLink {
+                    ResearchExportView()
+                } label: {
+                    SupportRowLabel(icon: "tablecells", title: "Research export",
+                                    detail: "Every heart beat and movement as CSV", trailing: "chevron.right")
+                }
+                .buttonStyle(.plain)
+                SupportDivider()
                 SupportRow(icon: "arrow.up.doc", title: "Restore from a backup",
                            detail: restoreNote ?? "Replaces what this iPhone holds",
                            disabled: ring.busy) { showRestorePicker = true }
@@ -1185,7 +1193,12 @@ struct RootView: View {
                             ObsStat(label: "serial", value: s.device?.serial ?? "–")
                             ObsStat(label: "firmware", value: s.device?.firmware ?? "–")
                             ObsStat(label: "battery",
-                                    value: s.device?.battery_pct.map { "\($0)%" } ?? "–",
+                                    value: s.device?.battery_pct.map { pct in
+                                        if let rec = s.device?.battery_recorded {
+                                            return "\(pct)% (\(rec))"
+                                        }
+                                        return "\(pct)%"
+                                    } ?? "–",
                                     accent: (s.device?.battery_pct ?? 100) < 20 ? Obs.bad : Obs.ink)
                             if let raw = s.device?.raw_events ?? s.device?.total_events {
                                 ObsStat(label: "events",

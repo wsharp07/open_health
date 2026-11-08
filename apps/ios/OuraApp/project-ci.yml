@@ -14,8 +14,8 @@ options:
 
 settings:
   base:
-    MARKETING_VERSION: "0.1.1"
-    CURRENT_PROJECT_VERSION: "40"
+    MARKETING_VERSION: "0.1.2"
+    CURRENT_PROJECT_VERSION: "42"
     PRODUCT_BUNDLE_IDENTIFIER: md.thomas.openoura
     TARGETED_DEVICE_FAMILY: "1"   # iPhone only (no iPad multitasking orientation reqs)
     CODE_SIGN_STYLE: Automatic
@@ -47,12 +47,15 @@ targets:
       - path: Reports.swift
       - path: DayExport.swift
       - path: RawData.swift
+      - path: ResearchExport.swift
       - path: HeartRate.swift
       - path: Theme.swift
       - path: BLETransport.swift
       - path: RingSync.swift
       - path: ProfileSettings.swift
       - path: ModelProgress.swift
+      - path: SleepStaging.swift
+      - path: IbiCorrection.swift
       - path: CrashCatch.c
       - path: CrashCatch.h
       - path: Diagnostics.swift

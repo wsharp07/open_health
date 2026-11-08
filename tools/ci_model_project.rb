@@ -6,8 +6,9 @@ app = spec.fetch('targets').fetch('OuraApp')
 app.fetch('settings').fetch('base')['SWIFT_ACTIVE_COMPILATION_CONDITIONS'] = 'TORCH'
 app.fetch('settings').fetch('base')['SWIFT_OBJC_BRIDGING_HEADER'] = 'TorchBridge.h'
 spec.fetch('targets').fetch('OuraAppTests').fetch('settings').fetch('base')['SWIFT_ACTIVE_COMPILATION_CONDITIONS'] = 'TORCH'
-%w[EventStore.swift ModelCache.swift SleepStaging.swift ActivityModel.swift CvaModel.swift IllnessModel.swift].each do |path|
+%w[EventStore.swift ModelCache.swift ActivityModel.swift CvaModel.swift IllnessModel.swift].each do |path|
   app.fetch('sources') << { 'path' => path }
 end
 app.fetch('sources') << { 'path' => '../../../tools/ci_model_bridge.c' }
+app.fetch('sources') << { 'path' => 'NssaOps.c', 'compilerFlags' => ['-ffp-contract=off'] }
 File.write(File.join(root, 'project-model-validation.yml'), YAML.dump(spec))

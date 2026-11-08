@@ -43,6 +43,12 @@ struct FingerprintedEntry<Value: Codable>: Codable {
 struct StagedNightEntry: Codable {
     var fp: String
     var stages: [Int]
+    /// Summary window that these cells were mapped onto. Missing in older caches.
+    var windowKey: String? = nil
+    /// "nssa" (Oura's sleepstaging model) or "signals" (our estimate when NSSA cannot run).
+    var source: String? = nil
+    /// Wall-clock start (unix s) of the first NSSA epoch (floor30 of the bedtime start).
+    var t0Unix: Double? = nil
 }
 
 private struct ModelCacheFile<Entry: Codable>: Codable {
@@ -88,7 +94,7 @@ enum ModelCacheStore {
     // ambiguous multi-reboot stall intervals.
     // 10: Oura Gen 4 0x75 sleep_temp_event, 0x60/0x80 IBI deduplication, and N3 deep
     // sleep recovery.
-    static let version = 10
+    static let version = 11
     static let cvaFile = "cva-model-cache.json"
     static let illnessFile = "illness-model-cache.json"
     static let activityFile = "activity-model-cache.json"

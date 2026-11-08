@@ -218,12 +218,11 @@ impl ModelRunner for PythonRunner {
             }),
             _ => (None, None, None, None),
         };
-        let needs_fallback = sleep_batch
-            .as_ref()
-            .and_then(|v| v.as_array())
-            .is_none_or(|a| a.is_empty());
-        if needs_fallback && !sleep_ranges.is_empty() {
-            sleep_batch = oura_summary::stage_nights_from_signals(db, sleep_ranges);
+        if sleep_batch_needs_fallback(sleep_batch.as_ref(), sleep_ranges.len())
+            && !sleep_ranges.is_empty()
+        {
+            let signals = oura_summary::stage_nights_from_signals(db, sleep_ranges);
+            sleep_batch = merge_sleep_fallback(sleep_batch, signals);
         }
         ModelOutputs {
             sleep_batch,
@@ -232,6 +231,52 @@ impl ModelRunner for PythonRunner {
             illness,
         }
     }
+}
+
+/// Whether the Python sleep batch must be topped up from the signal estimator.
+///
+/// `run_sleep_model.py --batch` returns one entry per sleep range, in order: a staged
+/// dict, or `null` for a window it couldn't stage (no torch/models, or NSSA inputs
+/// missing), still exiting 0. A top-up is needed when the batch is missing, the wrong
+/// length (the per-range contract was broken), or carries any null night. Kept beside
+/// [`merge_sleep_fallback`] so the "when to fall back" and the "what to replace" stay
+/// in agreement — this predicate is the line whose all-or-nothing form was the bug.
+fn sleep_batch_needs_fallback(batch: Option<&Value>, range_count: usize) -> bool {
+    match batch.and_then(|v| v.as_array()) {
+        None => true,
+        Some(a) => a.len() != range_count || a.iter().any(Value::is_null),
+    }
+}
+
+/// Fill the Python sleep batch's missing per-night entries with the signal-derived
+/// fallback. `signals` is authoritative on night count and order (exactly one entry
+/// per sleep range), so the merged result has one entry per range: the Python staging
+/// where present, otherwise the signal estimate.
+///
+/// A Python `null` (window the model couldn't stage) is replaced by its signal
+/// estimate — otherwise the night keeps its physiology but shows no sleep at all.
+/// Nights Python staged are preserved. A Python entry with no signal counterpart
+/// (length mismatch — not expected from the current producer) is dropped, since
+/// without a range it cannot be mapped onto a night anyway; a missing Python entry is
+/// simply the signal estimate. If signals are unavailable, the Python batch is
+/// returned untouched.
+fn merge_sleep_fallback(python: Option<Value>, signals: Option<Value>) -> Option<Value> {
+    let Some(Value::Array(sig)) = signals else {
+        return python;
+    };
+    let py = match python {
+        Some(Value::Array(py)) => py,
+        _ => Vec::new(),
+    };
+    let merged = sig
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| match py.get(i) {
+            Some(p) if !p.is_null() => p.clone(),
+            _ => s,
+        })
+        .collect();
+    Some(Value::Array(merged))
 }
 
 /// `build_summary` for the web dashboard — runs the models via Python.
@@ -469,6 +514,7 @@ async fn handle(
     let forbid = matches!(
         (method, path),
         ("POST", "/api/profile")
+            | ("POST", "/api/research-marker")
             | ("POST", "/api/bedtime")
             | ("POST", "/api/sync")
             | ("POST", "/api/live-hr")
@@ -675,6 +721,54 @@ async fn handle(
             .map_err(|e| anyhow!(e))?;
             match body {
                 Ok(v) => json_resp(&mut sock, &v).await,
+                Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
+            }
+        }
+        ("GET", "/api/research-export") => {
+            // ZIP of raw per-beat / per-window CSVs for [start, end) — the same
+            // `research_export` the iOS app and `oura research-export` use.
+            let num = |k: &str| query_param(query, k).and_then(|v| v.parse::<f64>().ok());
+            let (Some(start), Some(end)) = (num("start"), num("end")) else {
+                return write_resp(&mut sock, "400 Bad Request", "text/plain", b"start and end (unix seconds) are required").await;
+            };
+            let streams: Vec<_> = query_param(query, "streams")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(oura_summary::research_export::Stream::from_id)
+                .collect();
+            let tz = num("tz").unwrap_or(effective_tz);
+            let built = tokio::task::spawn_blocking(move || {
+                use oura_summary::research_export as rx;
+                let export = rx::build(&db, &rx::Request { start_unix: start, end_unix: end, streams, tz_offset_hours: tz })?;
+                let name = rx::bundle_name(start, tz);
+                Ok::<_, anyhow::Error>((rx::to_zip(&export, &name)?, name))
+            })
+            .await
+            .map_err(|e| anyhow!(e))?;
+            match built {
+                Ok((zip, name)) => {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Disposition: attachment; filename=\"{name}.zip\"\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                        zip.len()
+                    );
+                    sock.write_all(head.as_bytes()).await?;
+                    sock.write_all(&zip).await?;
+                    Ok(())
+                }
+                Err(e) => write_resp(&mut sock, "400 Bad Request", "text/plain", e.to_string().as_bytes()).await,
+            }
+        }
+        ("POST", "/api/research-marker") => {
+            let label = serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|v| v["label"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as f64 / 1000.0)
+                .unwrap_or(0.0);
+            match oura_summary::research_export::add_marker(&db, now, &label) {
+                Ok(()) => json_resp(&mut sock, &json!({ "ok": true, "unix": now })).await,
                 Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
             }
         }
@@ -1025,6 +1119,84 @@ fn run_feature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_fills_only_null_nights_and_keeps_python_stages() {
+        // Python staged nights 0 and 2 but emitted null for night 1 (NSSA could not
+        // stage it, or no torch). The fallback must fill exactly night 1 from signals
+        // and leave the Python results untouched.
+        let python = json!([{"source": "nssa", "stages": [1, 2]}, null, {"source": "nssa"}]);
+        let signals = json!([{"source": "signals"}, {"source": "signals", "stages": [2, 3]}, {"source": "signals"}]);
+        let out = merge_sleep_fallback(Some(python), Some(signals)).unwrap();
+        assert_eq!(
+            out,
+            json!([
+                {"source": "nssa", "stages": [1, 2]},
+                {"source": "signals", "stages": [2, 3]},
+                {"source": "nssa"},
+            ])
+        );
+    }
+
+    #[test]
+    fn fallback_takes_whole_signal_array_when_python_absent_or_empty() {
+        let signals = json!([{"source": "signals"}]);
+        // Python crashed (no torch) → None.
+        assert_eq!(
+            merge_sleep_fallback(None, Some(signals.clone())),
+            Some(signals.clone())
+        );
+        // Python returned an empty batch.
+        assert_eq!(
+            merge_sleep_fallback(Some(json!([])), Some(signals.clone())),
+            Some(signals)
+        );
+    }
+
+    #[test]
+    fn fallback_length_follows_signals_one_per_range() {
+        // Signals are authoritative on night count/order (one per range). A Python
+        // batch shorter than signals must not drop the uncovered nights, and a Python
+        // batch longer must not append orphans that map to no range.
+        let signals = json!([{"n": 0}, {"n": 1}]);
+        // Python shorter (only night 0 staged): night 1 comes from signals.
+        assert_eq!(
+            merge_sleep_fallback(Some(json!([{"py": 0}])), Some(signals.clone())),
+            Some(json!([{"py": 0}, {"n": 1}]))
+        );
+        // Python longer: the orphan third entry is dropped.
+        assert_eq!(
+            merge_sleep_fallback(
+                Some(json!([null, {"py": 1}, {"orphan": true}])),
+                Some(signals)
+            ),
+            Some(json!([{"n": 0}, {"py": 1}]))
+        );
+    }
+
+    #[test]
+    fn fallback_is_a_noop_when_signals_unavailable() {
+        // No events to stage from: keep whatever Python returned rather than blanking.
+        let python = json!([null]);
+        assert_eq!(
+            merge_sleep_fallback(Some(python.clone()), None),
+            Some(python)
+        );
+    }
+
+    #[test]
+    fn needs_fallback_fires_on_null_missing_or_wrong_length_only() {
+        // The gate that was the bug: a fully-staged batch of the right length needs
+        // nothing; a null night, a missing batch, or a per-range count mismatch do.
+        assert!(!sleep_batch_needs_fallback(Some(&json!([{"s": 1}, {"s": 2}])), 2));
+        assert!(sleep_batch_needs_fallback(Some(&json!([{"s": 1}, null])), 2));
+        assert!(sleep_batch_needs_fallback(None, 2));
+        assert!(sleep_batch_needs_fallback(Some(&json!([{"s": 1}])), 2)); // too short
+        assert!(sleep_batch_needs_fallback(Some(&json!([])), 1)); // empty vs one range
+        assert!(!sleep_batch_needs_fallback(Some(&json!([])), 0)); // no ranges, no work
+    }
+
+
     #[tokio::test]
     async fn live_stderr_is_drained_without_unbounded_retention() {
         let (mut writer, reader) = tokio::io::duplex(1024);

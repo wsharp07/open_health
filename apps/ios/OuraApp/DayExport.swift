@@ -70,11 +70,11 @@ struct DayExport: Encodable {
         case .sleep:
             guard let n = s.night(forDay: day) else { return }
             let metrics = n.hypnogram.flatMap { st in
-                Sleep.metrics(Sleep.smooth(st, 5), inBedS: n.durationS)
+                Sleep.metrics(Sleep.isOuraStaging(n.staging_source) ? st : Sleep.smooth(st, 5), inBedS: n.durationS)
             }
             var autonomic: Autonomic?
             if let st = n.hypnogram {
-                let a = Sleep.autonomic(night: n, stages: Sleep.smooth(st, 5))
+                let a = Sleep.autonomic(night: n, stages: Sleep.isOuraStaging(n.staging_source) ? st : Sleep.smooth(st, 5))
                 if a.any { autonomic = Autonomic(a) }
             }
             sleep = SleepSection(night: n, metrics: metrics.map(Metrics.init),

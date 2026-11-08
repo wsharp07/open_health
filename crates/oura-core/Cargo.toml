@@ -24,6 +24,7 @@ async-trait = "0.1"
 # CSPRNG for minting a ring auth key on device (SecRandomCopyBytes on Apple)
 getrandom = "0.2"
 thiserror = "1"
+anyhow = "1"
 serde_json = "1"
 # direct read-only queries for the raw-event browser (oura-store exposes no
 # name-carrying event query); same version oura-store links, so one sqlite.

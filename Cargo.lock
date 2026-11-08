@@ -1308,6 +1308,7 @@ dependencies = [
 name = "oura-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "getrandom 0.2.17",
  "oura-analysis",
@@ -1387,6 +1388,7 @@ dependencies = [
  "oura-store",
  "rusqlite",
  "serde_json",
+ "zip",
 ]
 
 [[package]]

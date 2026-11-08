@@ -25,8 +25,7 @@
 //! highest beat actually measured, and the mean of every beat in between. There is no
 //! open/close — a heart rate is not a share price, and "the first beat of the hour"
 //! carries no information the range and the mean do not. Only `hrv_event` carries
-//! per-sample spacing (`interval_min`), so its samples are placed by `hrv_samples`
-//! (the event's timestamp ends the block, element i starts `(n − i)·interval` before);
+//! per-sample spacing (`interval_min`), so its samples are placed at `ds + i·interval`;
 //! the beat streams have no per-sample timestamps and sit at their event's time, which
 //! is honest — an event covers seconds, not hours.
 //!
@@ -162,34 +161,25 @@ pub fn hr_bins(
         let Ok(v) = serde_json::from_str::<Value>(jstr) else {
             continue;
         };
-        // hrv_event packs `interval_min`-minute averages that END at its timestamp;
-        // beats sit at their event's time.
-        let samples: Vec<(i64, f64)> = if name == "hrv_event" {
-            crate::hrv_samples(*ds, &v)
-                .into_iter()
-                .filter_map(|(at, hr, _)| hr.map(|bpm| (at, bpm)))
-                .collect()
-        } else {
-            let Some(bpms) = v["hr_bpm"].as_array() else {
-                continue;
-            };
-            bpms.iter()
-                .filter_map(Value::as_f64)
-                .map(|bpm| (*ds, bpm))
-                .collect()
+        let Some(bpms) = v["hr_bpm"].as_array() else {
+            continue;
         };
-        for (sample_ds, bpm) in samples {
+        // hrv_event packs `interval_min`-minute averages that walk back from the
+        // event's ring timestamp (its last sample); green beat estimates all share
+        // the stamp (step 0). See `packed_series`.
+        let is_avg = name == "hrv_event";
+        let step_ds = if is_avg { crate::hrv_step_ds(&v) } else { 0 };
+        for (sample_ds, bpm) in crate::packed_series(*ds, bpms, step_ds) {
             if !(MIN_BPM..=MAX_BPM).contains(&bpm) {
                 continue;
             }
             let at = clock.unix_s(sample_ds, *cu);
             let bar = bins.entry(bucket_start(at, tz, span)).or_default();
             bar.add(bpm);
-            if name == "hrv_event" {
+            if is_avg {
                 bar.averages += 1;
             }
-            if name == "green_ibi_quality_event" && latest.map_or(true, |(current, _)| at > current)
-            {
+            if !is_avg && latest.map_or(true, |(current, _)| at > current) {
                 latest = Some((at, bpm));
             }
         }
@@ -377,12 +367,12 @@ mod tests {
                 72_000,
                 json!({ "hr_bpm": [50, 500] }),
             );
-            // +3 h: firmware 5-minute averages for 3:00–3:10, written as the block
-            // closes at 3:10 — both land in the same hour
+            // firmware 5-minute averages. The event stamp is the packet's last sample
+            // (+3:05), so [40, 45] walk back to +3:00 and +3:05 — both in hour +3.
             push(
                 0x5d,
                 "hrv_event",
-                114_000,
+                111_000,
                 json!({ "interval_min": 5, "hr_bpm": [40, 45] }),
             );
             // +3 h: raw beat-to-beat, deliberately ignored — a 170 bpm "beat" during
@@ -484,12 +474,12 @@ mod tests {
                 45_000,
                 json!({ "hr_bpm": [80] }),
             );
-            // +3:00, +3:05, +3:10: three 5-minute averages, all in the 3:00 slot,
-            // written as the block closes at 3:15
+            // Three 5-minute averages. The event stamp is the packet's LAST sample
+            // (+3:10), so they walk back to +3:00, +3:05, +3:10 — all in the 3:00 slot.
             push(
                 0x5d,
                 "hrv_event",
-                117_000,
+                114_000,
                 json!({ "interval_min": 5, "hr_bpm": [40, 45, 50] }),
             );
         }

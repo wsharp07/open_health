@@ -43,6 +43,7 @@ metric there once and both clients receive it in the JSON.
 | **Full-page sleep report** (polysomnograph + clinical metrics + interpretation) | `openDayPage`→`sleepSection` (`tlBox` lanes from `nights[].series_t`, `hypnoSvg`) | `DayReportView`→`SleepReport`, `Polysomnograph` (Reports.swift) | `nights[].{stages_full,series,metrics}` | SleepNet |
 | **Sleep debt** (14-day card + cumulative debt / total sleep detail) | `renderSleepDebt`→`openSleepDebt` | `SleepDebtCard`→`SleepDebtDetail` | `sleep_debt`, grouped by wake date including naps | SleepNet |
 | **Day JSON export** (iOS: the open tab's section; web: the whole day — night + debt, daily stats + MET profile + workouts, and the heart-rate slots) | `openDayPage` "Export JSON" → `exportDayJson` (download) | `DayReportView` export menu → `DayExport` (copy / share sheet) | same sections as the report | — |
+| **Research export** (raw CSVs for a time window: every beat, 30 s movement, SpO2 ratio, skin temperature, on the corrected clock; README + manifest in the ZIP) | "Research export" panel → `GET /api/research-export?start&end&streams&tz` | Help & diagnostics → Research export → `ResearchExportView` (share sheet) | `oura_summary::research_export` (`build` + `to_zip`), also `oura research-export` | — |
 | **Full-page activity report** (24h MET profile + intensity metrics) | `openDayPage`→`activitySection`, `movementSvg` | `DayReportView`→`ActivityReport`, `MetProfile` (Reports.swift) | `activity_profile`, `activity_daily`, `activity` | AAD |
 | **Heart rate across the day** (per-slot 5th–95th band + median tick; beats vs 5-min averages) | `openDayPage`→`heartSection`, `hrTimelineSvg` (`GET /api/hourly-hr?minutes=`; 15 min default, 1 h switch) | `HeartRate.swift` (`HourlyHR`, hourly) | `oura-summary::hourly_hr::{hr_bins, hourly_hr}` (not in the summary JSON) | — |
 | Stage breakdown | `stageBar` | `StageBreakdown` | `nights[].{deep,light,rem,wake}_pct` | SleepNet |
@@ -139,7 +140,10 @@ summary JSON; iOS recomputes from the
 **on-device** SleepNet hypnogram (`NightRow.stages`), because iOS runs `build_summary` with
 `NoModelRunner` (no server-side staging), so the FFI `stages_full`/`metrics` are empty there.
 The raw signal series (`nights[].series`) DO come from the FFI on both. If you change the
-smoothing window or a metric definition, change **both** implementations.
+smoothing window or a metric definition, change **both** implementations. Oura's own stagings
+(`staging_source` `nssa` or `ring`) are never smoothed or deep-refined (`is_oura_staging` /
+`Sleep.isOuraStaging`); only the signal-derived estimate is. Both clients also draw
+`stages_5min`, the official app's 5-minute chart (`aggregate_30s_to_5min` / `Sleep.aggregate5Min`).
 
 **Autonomic-by-stage** (mean HR/HRV per sleep stage) is the same story: Rust
 `autonomic_by_stage` fills `nights[].autonomic` for the web; iOS recomputes in Swift
@@ -151,6 +155,32 @@ hair. We expose per-stage means (esp. deep-sleep HRV) rather than an overnight H
 nocturnal HRV is stage-driven (deep ↑, REM ↓), so a slope tracks stage order, not recovery —
 which is why Oura's own app has no per-night HRV trend either.
 
+## Packed HR/HRV samples are stamped at the packet's *last* sample
+
+A firmware `hrv_event` carries several `interval_min`-minute averages (`hr_bpm`,
+`rmssd_ms`) under **one** ring timestamp, and the raw beat packets (`0x60`,
+`ibi_and_amplitude`) carry several beats under one stamp. In every case the ring
+stamps the packet at its **last (newest)** sample and the earlier ones lead up to
+it — so element `i` of `len` sits `(len-1-i) * step` *before* the stamp, never
+after it. A 7-sample 5-minute packet therefore spans the 30 minutes **ending** at
+the stamp.
+
+Placing samples *forward* from the stamp instead pushes the newest one up to a full
+packet span into the future of its own emission and shifts the whole nocturnal
+HR/HRV series late by that span (~30 min), desynchronising it from the motion
+stream and the hypnogram — which under-detects deep sleep (N3 refinement reads the
+wrong HR/HRV window). This bit us once; keep every client on the walk-back rule:
+
+- **Rust** (`crates/oura-summary`): go through `packed_series` / `packed_sample_ds`
+  (and `hrv_step_ds`); never re-derive `ds + i*step` by hand.
+- **Python**: `tools/nssa_inputs.py` (`expand_ibi_event`, temp expansion) and the
+  model runners walk back; match them when adding a runner.
+- **Reference**: `research_export::beat_times` and its CSV note ("packet time is the
+  last beat, earlier beats walk back") are the canonical statement of the rule.
+
+The real end state is to stamp each sample **once in the `open_oura` decoder** so no
+client re-derives packet timing at all — tracked as a follow-up.
+
 ## Known gaps (iOS-only, not yet on the web)
 
 Now on both: the model-free Symptom Radar (`symptoms`, used when the Python runner
@@ -158,6 +188,16 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
 
 - **Sleep report without a hypnogram**: iOS still draws the time-in-bed strip and the
   signal lanes; the web returns early.
+- **iOS NSSA cache admission** includes the current model demographics before the
+  automatic planner reuses a night. The web runner already fingerprints demographics
+  with each request; iOS also checks them before its shortcut can skip that request.
+  Cache entries bind their mapped window, so a changed bedtime end cannot reuse cells
+  from the old interval. Saved NSSA summaries can satisfy the automatic plan; older
+  SleepNet summaries cannot substitute for NSSA.
+- **Apple Health HRV export** uses the RMSSD type on iOS 27 and later. On older
+  systems, ring RMSSD remains visible in the app rather than being mislabeled as
+  SDNN. Reconciliation removes only this exporter's legacy `openoura.hrv.*` SDNN
+  records, using existing authorization; it requests no new SDNN access.
 - **Sleep score + breathing rate** (`nights[].sleep_score`, `breath_rate`).
 - **Skin temperature / latest HR vitals and trend pages**, **hourly heart rate**
   (`hourly_hr` is FFI-only; no `/api` endpoint yet).
@@ -189,11 +229,16 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
   (`hr_bins`, with a 15 min / 1 h switch); iOS `HeartRate.swift` still shows hourly bars.
 - **Live heart rate** panel: `POST /api/live-hr` streams beats from `oura live-hr`
   (one minute per session, stoppable) as newline-delimited JSON.
+- **"Signal estimate" staging notice**: when a night is staged by the Rust signal
+  fallback (`staging_source === "signals"`, i.e. Python/torch or the `.pt` model is
+  absent on this machine), the web day view shows a note saying so and how to enable
+  Oura's model. iOS bundles the on-device model, so this condition is rare there and
+  has no matching label yet.
 
 - **Advanced & debugging**: on-ring feature toggles (`/api/feature`) and the per-type
   event stream. Profile editing is now native on iOS, including optional Apple Health
   import for date of birth, biological sex, height, and weight, plus optional export
-  of workouts (add/remove as detections change), sleep stages, heart rate, HRV,
+  of workouts (add/remove as detections change), sleep stages, heart rate, RMSSD HRV (iOS 27+),
   resting HR, steps, calories, and distance.
 - **Polysomnograph crosshair**: web has a hover crosshair; iOS uses a touch scrubber
   (drag across the lanes) — same idea, adapted to the input.

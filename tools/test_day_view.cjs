@@ -31,6 +31,13 @@ const motion = [...w.document.querySelectorAll('.tl-row')].find(row => row.textC
 // A sparse motion measurement must remain visible and must not become a smooth curve.
 assert(motion, 'motion lane missing');
 assert(!motion.querySelector('path'));
+// An NSSA night also gets the official app's 5-minute chart, laid from its first epoch.
+const nssa = { ...data, nights: [{ ...night, stages_full: new Array(40).fill(2), staging_complete: true,
+  staging_source: 'nssa', stages_5min: [4, 2, 1, 3], stages_t0_unix: start - 20 }] };
+w.openDayPage(nssa, '2026-09-26');
+const lanes = [...w.document.querySelectorAll('.tl-row')].map(row => row.textContent);
+assert(lanes.some(t => t.includes('Stages · 5 min (Oura app)')), '5-minute Oura lane missing');
+assert(lanes.some(t => t.includes('Stages') && !t.includes('5 min')), '30 s stage lane missing');
 const absent = { ...data, nights: [{ ...night, start_ds: 10000, end_ds: 298000, stages_full: [] }] };
 w.openDayPage(absent, '2026-09-26');
 assert(w.document.querySelector('#sec-sleep').textContent.includes('stages are unavailable'));

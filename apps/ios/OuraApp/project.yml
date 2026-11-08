@@ -30,8 +30,8 @@ schemes:
 
 settings:
   base:
-    MARKETING_VERSION: "0.1.1"
-    CURRENT_PROJECT_VERSION: "40"
+    MARKETING_VERSION: "0.1.2"
+    CURRENT_PROJECT_VERSION: "42"
     PRODUCT_BUNDLE_IDENTIFIER: md.thomas.openoura
     TARGETED_DEVICE_FAMILY: "1"   # iPhone only (no iPad multitasking orientation reqs)
     CODE_SIGN_STYLE: Automatic
@@ -79,6 +79,7 @@ targets:
       - path: Reports.swift
       - path: DayExport.swift
       - path: RawData.swift
+      - path: ResearchExport.swift
       - path: HeartRate.swift
       - path: Theme.swift
       - path: BLETransport.swift
@@ -88,6 +89,10 @@ targets:
       - path: ModelCache.swift
       - path: ModelProgress.swift
       - path: SleepStaging.swift
+      - path: IbiCorrection.swift
+      - path: NssaOps.c
+        compilerFlags: [-ffp-contract=off]
+      - path: NssaOps.h
       - path: CvaModel.swift
       - path: ActivityModel.swift
       - path: IllnessModel.swift
@@ -101,7 +106,10 @@ targets:
       - path: Assets.xcassets
       # bundled models + data (gitignored local files). oura.db is temporary until the
       # on-device BLE sync lands — then the app builds its own DB from your ring.
-      - path: ../../../notes/models/mobile/sleepnet_moonstone_1_2_0.ptl
+      # NSSA sleep stager + its tree-ensemble classifier (tools/extract_nssa_classifier.py)
+      - path: ../../../notes/models/mobile/sleepstaging_2_6_0.ptl
+        buildPhase: resources
+      - path: ../../../notes/models/mobile/sleepstaging_2_6_0_classifier.bin
         buildPhase: resources
       - path: ../../../notes/models/mobile/cva_2_1_0.ptl
         buildPhase: resources

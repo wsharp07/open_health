@@ -1,5 +1,9 @@
 # SleepNet (sleep staging model)
 
+> **Superseded.** The models are decrypted and the official hypnogram is reproduced with
+> `sleepstaging_2_6_0` (NSSA) — see [sleep-staging.md](sleep-staging.md). The notes below
+> document the original decryption work.
+
 The sleep **hypnogram** (per-30s DEEP/LIGHT/REM/AWAKE) is produced on the phone by
 a PyTorch model - *not* by ecore (which only computes staging features and
 everything downstream of the stage array). The models ship encrypted in the APK:
