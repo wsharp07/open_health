@@ -2256,12 +2256,57 @@ fn make_digest(hrv: &VitalStat, rhr: &VitalStat) -> String {
     s
 }
 
+/// One local day of all-day activity, summed from per-minute MET.
+#[derive(Default)]
+struct DayActivity {
+    active_kcal: f64,
+    /// Estimated, see [`prior_steps_per_min`].
+    steps: f64,
+    /// Minutes at or above [`ACTIVE_MET`].
+    active_min: u32,
+    /// Minutes with a MET reading, so a client can tell a partly synced day.
+    minutes: u32,
+}
+
+/// A minute at or above this MET counts as active (moderate intensity and up).
+const ACTIVE_MET: f64 = 3.0;
+/// Length of one `motion_event` window, seconds.
+const MOTION_WINDOW_S: f64 = 30.0;
+
+/// Estimated steps in one minute, from its MET and the share of the minute the hand was
+/// moving (`None` when the ring logged no motion windows for it). The ring has no step
+/// counter we can read, so this is a fixed prior: walking cadence at moderate MET,
+/// running cadence at high MET, nothing when still. Scaling by motion keeps a minute of
+/// effort with a still hand (a bike, a plank) from counting as a full minute of walking.
+pub fn prior_steps_per_min(met: f64, moving: Option<f64>) -> f64 {
+    let cadence = if met >= 6.0 {
+        160.0
+    } else if met >= 2.5 {
+        105.0
+    } else {
+        return 0.0;
+    };
+    cadence * moving.unwrap_or(1.0).clamp(0.0, 1.0)
+}
+
 /// Assemble the full dashboard summary as a JSON value. The torch models are
 /// supplied by `runner` (Python subprocess on desktop, `.ptl` on-device).
 pub fn build_summary(
     db: &Path,
     tz: impl Into<OffsetHours>,
     runner: &dyn ModelRunner,
+) -> Result<Value> {
+    build_summary_with_profile(db, tz, runner, None)
+}
+
+/// [`build_summary`] with the wearer's profile passed in rather than read from the
+/// `profile.json` next to the DB. A client that keeps the profile elsewhere (the phone's
+/// Health data, say) uses this so calories aren't computed for a default 30-year-old.
+pub fn build_summary_with_profile(
+    db: &Path,
+    tz: impl Into<OffsetHours>,
+    runner: &dyn ModelRunner,
+    profile: Option<Demographics>,
 ) -> Result<Value> {
     let tz = tz.into().0;
     anyhow::ensure!(
@@ -2274,7 +2319,7 @@ pub fn build_summary(
             .unwrap_or_else(|_| db.to_path_buf())
     });
     let db = db_abs.as_path();
-    let demo = read_profile(db);
+    let demo = profile.unwrap_or_else(|| read_profile(db));
     let _ = Store::migrate_if_writable(db);
     let store = Store::open_read_only(db).context("opening DB")?;
     let events = store.decoded_events().context("reading events")?;
@@ -2987,7 +3032,26 @@ pub fn build_summary(
 
     let mut prof_sum: std::collections::BTreeMap<String, [f64; 96]> = Default::default();
     let mut prof_cnt: std::collections::BTreeMap<String, [u32; 96]> = Default::default();
-    let mut daily: std::collections::BTreeMap<String, (f64, f64)> = Default::default();
+    let mut daily: std::collections::BTreeMap<String, DayActivity> = Default::default();
+    // Seconds of hand motion per wall-clock minute, from the 30 s `motion_event` windows:
+    // (seconds moving, seconds covered). Scales the step estimate below.
+    let mut motion_min: std::collections::HashMap<i64, (f64, f64)> = Default::default();
+    for (ds, tag, jstr, cu) in &events {
+        if name_of(*tag) != "motion_event" || !is_dated(*ds, *cu) {
+            continue;
+        }
+        let Some(secs) = serde_json::from_str::<Value>(jstr)
+            .ok()
+            .and_then(|v| v["motion_seconds"].as_f64())
+        else {
+            continue;
+        };
+        let m = motion_min
+            .entry((unix_s_at(*ds, *cu) / 60.0).floor() as i64)
+            .or_default();
+        m.0 += secs.clamp(0.0, MOTION_WINDOW_S);
+        m.1 += MOTION_WINDOW_S;
+    }
     let mut met_min: std::collections::BTreeMap<i64, f64> = Default::default();
     // (ring, local day) → (active MET-minutes, minutes with a reading), for readiness.
     let mut ring_days: std::collections::BTreeMap<(String, i64), (f64, u32)> = Default::default();
@@ -3024,16 +3088,16 @@ pub fn build_summary(
                         .clamp(0.0, 95.0) as usize;
                     prof_sum.entry(key.clone()).or_insert([0.0; 96])[bucket] += (mv - 1.0).max(0.0);
                     prof_cnt.entry(key.clone()).or_insert([0; 96])[bucket] += 1;
-                    let step_rate = if mv >= 7.0 {
-                        150.0
-                    } else if mv >= 2.5 {
-                        105.0
-                    } else {
-                        0.0
-                    };
-                    let e = daily.entry(key).or_insert((0.0, 0.0));
-                    e.0 += (mv - 1.0).max(0.0) * weight / 60.0;
-                    e.1 += step_rate;
+                    let moving = motion_min
+                        .get(&((unix / 60.0).floor() as i64))
+                        .map(|(moving, covered)| moving / covered);
+                    let e = daily.entry(key).or_default();
+                    e.active_kcal += (mv - 1.0).max(0.0) * weight / 60.0;
+                    e.steps += prior_steps_per_min(mv, moving);
+                    e.minutes += 1;
+                    if mv >= ACTIVE_MET {
+                        e.active_min += 1;
+                    }
                     *met_min.entry((local / 60.0).floor() as i64).or_insert(0.0) +=
                         (mv - 1.0).max(0.0);
                     if let Some(serial) = serial_at.get(cu) {
@@ -3088,17 +3152,19 @@ pub fn build_summary(
 
     let activity_daily: Value = daily
         .iter()
-        .map(|(k, (act, steps))| {
-            let steps_r = (steps / 100.0).round() * 100.0;
+        .map(|(k, day)| {
+            let steps_r = (day.steps / 100.0).round() * 100.0;
             // walking distance from steps via ecore's actinfo_steps_to_meters (0.762 m/step)
             let distance_m = oura_analysis::ported::metabolic::steps_to_meters(steps_r as u32);
             (
                 k.clone(),
                 json!({
-                    "active_kcal": act.round(),
-                    "total_kcal": (bmr_kcal_day + act).round(),
+                    "active_kcal": day.active_kcal.round(),
+                    "total_kcal": (bmr_kcal_day + day.active_kcal).round(),
                     "steps": steps_r,
                     "distance_m": distance_m,
+                    "active_min": day.active_min,
+                    "minutes": day.minutes,
                 }),
             )
         })
@@ -4368,6 +4434,99 @@ mod tests {
         assert_eq!(night_reset["end_ds"], 298_000);
         assert_eq!(night_reset["bedtime_manual"], false);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_prior_follows_cadence_bands_and_hand_motion() {
+        assert_eq!(prior_steps_per_min(1.2, None), 0.0);
+        assert_eq!(prior_steps_per_min(1.2, Some(1.0)), 0.0);
+        assert_eq!(prior_steps_per_min(3.0, None), 105.0);
+        assert_eq!(prior_steps_per_min(8.0, None), 160.0);
+        assert_eq!(prior_steps_per_min(3.0, Some(0.5)), 52.5);
+        // effort with a still hand (a bike) is not walking
+        assert_eq!(prior_steps_per_min(8.0, Some(0.0)), 0.0);
+        assert_eq!(prior_steps_per_min(3.0, Some(4.0)), 105.0);
+    }
+
+    #[test]
+    fn activity_daily_uses_the_given_profile_motion_and_active_minutes() {
+        let dir = std::env::temp_dir().join(format!(
+            "oura-activity-daily-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("oura.db");
+        drop(Store::open(&db).unwrap());
+
+        // 2026-05-28 20:26:40 UTC; everything below lands on that UTC day.
+        let base_unix = 1_780_000_000i64;
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let insert = |tag: u8, name: &str, ds: i64, json: String| {
+            conn.execute(
+                "INSERT INTO events (serial, tag, name, ring_timestamp, body, decoded_json, captured_unix)
+                 VALUES ('S1', ?1, ?2, ?3, X'00', ?4, ?5)",
+                rusqlite::params![tag, name, ds, json, base_unix + 3600],
+            )
+            .unwrap();
+        };
+        insert(66, "time_sync", 1000, format!("{{\"unix_time\":{base_unix}}}"));
+        // 20 minutes at rest, 10 walking (MET 4), 10 hard with a still hand (MET 8).
+        let met: Vec<String> = (0..40)
+            .map(|i| match i {
+                0..=19 => "1.0",
+                20..=29 => "4.0",
+                _ => "8.0",
+            })
+            .map(str::to_string)
+            .collect();
+        // Starts on a whole minute, 200 s after the time sync.
+        let start_ds = 1000 + 2000;
+        insert(
+            0x50,
+            "activity_information",
+            start_ds,
+            format!("{{\"met\":[{}]}}", met.join(",")),
+        );
+        // Motion windows every 30 s: the hand moves through the walk, half the time in
+        // its last two minutes, and not at all during the hard effort.
+        for w in 0..80 {
+            let minute = w / 2;
+            let secs = match minute {
+                20..=27 => 30,
+                28..=29 => 15,
+                _ => 0,
+            };
+            insert(
+                0x47,
+                "motion_event",
+                start_ds + w * 300,
+                format!("{{\"motion_seconds\":{secs}}}"),
+            );
+        }
+        drop(conn);
+
+        let light = Demographics {
+            weight_kg: 60.0,
+            ..Demographics::default()
+        };
+        let sum = build_summary_with_profile(&db, 0.0, &NoModelRunner, Some(light)).unwrap();
+        let day = &sum["activity_daily"]["2026-05-28"];
+        assert_eq!(day["minutes"], 40);
+        assert_eq!(day["active_min"], 20);
+        // (3 × 10 + 7 × 10) MET-minutes above rest × 60 kg / 60
+        assert_eq!(day["active_kcal"], 100.0);
+        // 8 full walking minutes + 2 half ones at 105 spm = 945, shown to the nearest 100
+        assert_eq!(day["steps"], 900.0);
+        assert_eq!(sum["profile"]["weight_kg"], 60.0);
+
+        // Without a profile argument the file next to the DB (here: defaults) is used.
+        let sum = build_summary(&db, 0.0, &NoModelRunner).unwrap();
+        assert_eq!(sum["activity_daily"]["2026-05-28"]["active_kcal"], 125.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

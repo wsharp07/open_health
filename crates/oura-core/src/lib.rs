@@ -44,6 +44,26 @@ pub fn summary_json(db_path: String, tz_offset: i64) -> String {
     }
 }
 
+/// [`summary_json`] with the wearer's profile passed in: `profile_json` is
+/// `{"age", "sex", "weight_kg", "height_m"}`, where `sex` is `"M"`, `"F"` or `"O"` and any
+/// missing field takes the default. Calories depend on it. Text that isn't JSON falls back
+/// to the `profile.json` next to the DB, like [`summary_json`].
+#[uniffi::export]
+pub fn summary_json_with_profile(db_path: String, tz_offset: i64, profile_json: String) -> String {
+    let profile = serde_json::from_str::<serde_json::Value>(&profile_json)
+        .ok()
+        .map(|v| oura_summary::Demographics::from_json(&v));
+    match oura_summary::build_summary_with_profile(
+        std::path::Path::new(&db_path),
+        tz_offset,
+        &oura_summary::NoModelRunner,
+        profile,
+    ) {
+        Ok(v) => v.to_string(),
+        Err(e) => json!({ "error": e.to_string() }).to_string(),
+    }
+}
+
 /// Hourly heart-rate bars for the HR detail screen — one bar per local-clock
 /// hour, `{low, high, mean, count}`, plus the newest quality-gated
 /// reading as `latest`.
