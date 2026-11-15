@@ -212,6 +212,11 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
 - **Sleep cycles, awakenings and heart-rate low** (`nights[].sleep_cycles`,
   `nights[].wakes` with a likely `cause`, `nights[].hr_low_unix`): the Noura app renders
   them; the web and `OuraApp` don't.
+- **Breathing rate source** (`nights[].breath_source`, `nights[].breath_from_beats`):
+  `breath_rate` is the ring's own per-window breath when it sent any (`"ring"`), else a
+  rate worked out from the night's heart beats (`"beats"`, see `breath.rs`). A Ring 4 can
+  stop sending its breath windows, which left `breath_rate` empty every night. Both
+  clients already show `breath_rate`; neither says which source it came from.
 - **Signal-estimated stages in a model-free build**: `build_summary` now fills any night
   that neither the model runner nor the ring staged with `stage_night_from_signals`
   (`staging_source: "signals"`), so `metrics`, `sleep_score` and `sleep_debt` exist

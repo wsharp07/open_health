@@ -12,6 +12,7 @@
 //! *render* it: web `dashboard/web/app.js`, iOS `apps/ios/OuraApp/OuraApp.swift`. See
 //! `docs/clients-web-and-ios.md`.
 
+pub mod breath;
 pub mod hourly_hr;
 pub mod readiness;
 pub mod research_export;
@@ -577,6 +578,10 @@ struct Night {
     /// (`sleep_period_information_2.breath`) — only windows it scored as sleep, since
     /// an awake breath rate is not the biomarker. One of the four Symptom Radar inputs.
     breath: Vec<f64>,
+    /// The night's heart beats, for a breathing rate when the ring sends none of its
+    /// own (see [`breath`]): the quality-flagged stream, and the raw one as a fallback.
+    beats_quality: Vec<breath::Beat>,
+    beats_raw: Vec<breath::Beat>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2599,6 +2604,30 @@ pub fn build_summary_with_profile(
                     }
                 }
             }
+            "green_ibi_quality_event" | "ibi_and_amplitude_event" => {
+                let ints = |key: &str| -> Option<Vec<i64>> {
+                    v[key]
+                        .as_array()
+                        .map(|a| a.iter().map(|x| x.as_i64().unwrap_or(0)).collect())
+                };
+                if let Some(ibi) = ints("ibi_ms") {
+                    // Seconds from just before the night's start: `find_night` lets a
+                    // packet in up to a minute early.
+                    let at = (*ds - nights[idx].start_ds + 600) as f64 / 10.0;
+                    if n == "green_ibi_quality_event" {
+                        let quality = ints("quality").unwrap_or_default();
+                        nights[idx].beats_quality.extend(breath::packet_beats(
+                            at,
+                            &ibi,
+                            Some(&quality),
+                        ));
+                    } else {
+                        nights[idx]
+                            .beats_raw
+                            .extend(breath::packet_beats(at, &ibi, None));
+                    }
+                }
+            }
             "sleep_temp_event" => {
                 // Only the dedicated nocturnal stream is calibrated as skin
                 // temperature. Generic `temp_event` contains several device/ambient
@@ -2832,7 +2861,16 @@ pub fn build_summary_with_profile(
         let raw_mean_hrv = mean(&nt.rmssd);
         let night_rhr = raw_lowest_hr.map(|x| x.round());
         let night_hrv = raw_mean_hrv.map(|x| x.round());
-        let night_breath = median_of(&nt.breath);
+        // The ring's own breath windows when it sent them, else the rhythm in its beats.
+        let ring_breath = median_of(&nt.breath);
+        let beat_breath =
+            breath::nightly_rate(&nt.beats_quality).or_else(|| breath::nightly_rate(&nt.beats_raw));
+        let night_breath = ring_breath.or(beat_breath.map(|b| b.rate));
+        let breath_source = match (ring_breath, beat_breath) {
+            (Some(_), _) => Value::from("ring"),
+            (None, Some(_)) => Value::from("beats"),
+            (None, None) => Value::Null,
+        };
         let is_main_sleep = (nt.end_ds - nt.start_ds) >= sleep_score::MIN_BASELINE_SLEEP_DS;
         let rhr_baseline = if is_main_sleep {
             let priors: Vec<f64> = prior_main_rhr
@@ -2960,6 +2998,15 @@ pub fn build_summary_with_profile(
             }) } else { Value::Null },
             "breath_rate": night_breath.map(|b| (b * 10.0).round() / 10.0),
         });
+        // "ring": the ring's own per-window breath. "beats": worked out from the night's
+        // heart beats because the ring sent none.
+        night_json["breath_source"] = breath_source;
+        // The beat-derived rate whenever there is one, so it can be checked against the
+        // ring's on nights that have both.
+        night_json["breath_from_beats"] = match beat_breath {
+            Some(b) => json!({ "rate": (b.rate * 10.0).round() / 10.0, "windows": b.windows }),
+            None => Value::Null,
+        };
         night_json["stages_5min"] = json!(stages_5min);
         night_json["stages_t0_unix"] = json!(stages_t0_unix);
         // the ring that measured this night, so baselines can stay on one ring
@@ -4547,6 +4594,113 @@ mod tests {
             hrv_samples(30_000, &partial),
             vec![(30_000, Some(68.0), Some(27.0))]
         );
+    }
+
+    /// A database with one eight-hour night whose beats breathe at 14.5 a minute, sent
+    /// as `tag` packets of seven beats (0x80 quality-flagged, 0x60 raw). `ring_breath`
+    /// adds the ring's own breath windows at that rate.
+    fn breathing_night(tag: i64, ring_breath: Option<f64>) -> Value {
+        let dir = std::env::temp_dir().join(format!(
+            "oura-breath-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("oura.db");
+        drop(Store::open(&db).unwrap());
+
+        let base_unix = 1_780_000_000i64;
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let insert = |ds: i64, tag: i64, name: &str, json: String| {
+            conn.execute(
+                "INSERT INTO events (serial, tag, name, ring_timestamp, body, decoded_json, captured_unix)
+                 VALUES ('S1', ?1, ?2, ?3, X'00', ?4, ?5)",
+                rusqlite::params![tag, name, ds, json, base_unix + 31_000],
+            )
+            .unwrap();
+        };
+        insert(
+            1_000,
+            66,
+            "time_sync",
+            format!("{{\"unix_time\":{base_unix}}}"),
+        );
+        insert(
+            298_000,
+            118,
+            "bedtime_period",
+            "{\"bedtime_start_ds\":10000,\"bedtime_end_ds\":298000}".into(),
+        );
+        let name = if tag == 0x80 {
+            "green_ibi_quality_event"
+        } else {
+            "ibi_and_amplitude_event"
+        };
+        let (mut t, mut packet) = (1_000.0f64, Vec::new());
+        while t < 29_800.0 {
+            let ibi = 1_000.0 + 40.0 * (std::f64::consts::TAU * 14.5 / 60.0 * t).sin();
+            t += ibi / 1000.0;
+            packet.push(ibi.round() as i64);
+            if packet.len() == 7 {
+                let ibis = packet
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let json = if tag == 0x80 {
+                    format!("{{\"ibi_ms\":[{ibis}],\"quality\":[1,1,1,1,1,1,1],\"hr_bpm\":[60]}}")
+                } else {
+                    format!("{{\"ibi_ms\":[{ibis}],\"hr_bpm\":[60]}}")
+                };
+                insert((t * 10.0).round() as i64, tag, name, json);
+                packet.clear();
+            }
+        }
+        if let Some(breath) = ring_breath {
+            for ds in (13_000..295_000).step_by(3_000) {
+                insert(
+                    ds,
+                    0x6a,
+                    "sleep_period_information_2",
+                    format!("{{\"breath\":{breath},\"sleep_state\":1}}"),
+                );
+            }
+        }
+        drop(conn);
+        let sum = build_summary(&db, 0.0, &NoModelRunner).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        sum["nights"].as_array().unwrap()[0].clone()
+    }
+
+    #[test]
+    fn breathing_rate_comes_from_beats_when_the_ring_sends_none() {
+        // Ring 4: its own breath windows stopped arriving, the beat stream did not.
+        let night = breathing_night(0x80, None);
+        let rate = night["breath_rate"].as_f64().unwrap();
+        assert!((rate - 14.5).abs() < 0.3, "{rate}");
+        assert_eq!(night["breath_source"], "beats");
+        assert_eq!(night["breath_from_beats"]["rate"], night["breath_rate"]);
+        assert!(night["breath_from_beats"]["windows"].as_u64().unwrap() > 400);
+    }
+
+    #[test]
+    fn breathing_rate_falls_back_to_raw_beats_without_the_quality_stream() {
+        let night = breathing_night(0x60, None);
+        let rate = night["breath_rate"].as_f64().unwrap();
+        assert!((rate - 14.5).abs() < 0.3, "{rate}");
+        assert_eq!(night["breath_source"], "beats");
+    }
+
+    #[test]
+    fn the_rings_own_breath_wins_and_the_beat_rate_rides_along() {
+        let night = breathing_night(0x80, Some(13.0));
+        assert_eq!(night["breath_rate"], 13.0);
+        assert_eq!(night["breath_source"], "ring");
+        let beats = night["breath_from_beats"]["rate"].as_f64().unwrap();
+        assert!((beats - 14.5).abs() < 0.3, "{beats}");
     }
 
     #[test]
